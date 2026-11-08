@@ -1,0 +1,4709 @@
+if not game:IsLoaded() then game.Loaded:Wait() end
+local function bootstrapCompatibility()
+    local genv = (type(getgenv) == "function" and getgenv()) or _G
+    local fenv = getfenv(1)
+    local missing = {}
+
+    local function grab(name)
+        for _, source in ipairs({ fenv, genv, _G }) do
+            local found, value = pcall(function()
+                return source[name]
+            end)
+            if found and type(value) == "function" then
+                return value
+            end
+        end
+        return nil
+    end
+
+    local function grabTable(name)
+        local found, value = pcall(function()
+            return fenv[name] or genv[name]
+        end)
+        if found and type(value) == "table" then
+            return value
+        end
+        return nil
+    end
+
+    local function publish(name, value)
+        if not value then
+            table.insert(missing, name)
+            return
+        end
+        pcall(function()
+            genv[name] = value
+        end)
+        pcall(function()
+            fenv[name] = value
+        end)
+    end
+
+    local connectionsOf = grab("getconnections") or grab("get_signal_cons")
+    publish("getconnections", connectionsOf)
+    local writeable = grab("make_writeable")
+    local readonly = grab("make_readonly")
+    local debugMeta = debug and debug.getmetatable
+
+    publish("getrawmetatable", grab("getrawmetatable") or grab("get_raw_metatable") or debugMeta)
+
+    publish("setreadonly", grab("setreadonly") or grab("set_readonly") or (writeable and readonly and function(target, state)
+        if state then
+            readonly(target)
+        else
+            writeable(target)
+        end
+    end))
+
+    publish("getnamecallmethod", grab("getnamecallmethod") or grab("get_namecall_method"))
+
+    local setIdentity = grab("setthreadidentity") or grab("set_thread_identity")
+    local readIdentity = grab("getthreadidentity") or grab("get_thread_identity")
+
+    if setIdentity then
+        publish("setthreadidentity", setIdentity)
+    end
+    if readIdentity then
+        publish("getthreadidentity", readIdentity)
+    end
+
+    local native = grab("firesignal") or grab("fire_signal")
+    local viaConnections = connectionsOf and function(signal, ...)
+        for _, connection in ipairs(connectionsOf(signal)) do
+            pcall(connection.Fire, connection, ...)
+        end
+    end
+
+    if native and viaConnections then
+        local probe = Instance.new("BindableEvent")
+        local landed = false
+        probe.Event:Connect(function()
+            landed = true
+        end)
+        pcall(native, probe.Event, true)
+        local waited = 0
+        while not landed and waited < 0.1 do
+            waited = waited + task.wait()
+        end
+        probe:Destroy()
+        if not landed then
+            native = nil
+        end
+    end
+
+    local fire = native or viaConnections
+    publish("firesignal", fire and function(signal, ...)
+        if not setIdentity then
+            return fire(signal, ...)
+        end
+        local restore = readIdentity and readIdentity()
+        pcall(setIdentity, 2)
+        pcall(fire, signal, ...)
+        if restore then
+            pcall(setIdentity, restore)
+        end
+    end)
+
+    publish("loadstring", grab("loadstring") or grab("load"))
+
+    local send = grab("request") or grab("http_request")
+    if not send then
+        local syntax = grabTable("syn") or grabTable("http") or grabTable("fluxus")
+        send = syntax and syntax.request
+    end
+
+    publish("httpGet", function(url)
+        local reached, body = pcall(function()
+            return game:HttpGet(url)
+        end)
+        if reached and type(body) == "string" and #body > 0 then
+            return body
+        end
+        if send then
+            local sent, response = pcall(send, { Url = url, Method = "GET" })
+            if sent and type(response) == "table" and type(response.Body) == "string" then
+                return response.Body
+            end
+        end
+        return nil
+    end)
+
+    local hidden = grab("gethui") or grab("get_hidden_gui")
+    local guard = grab("protect_gui")
+    if not guard then
+        local syntax = grabTable("syn")
+        guard = syntax and syntax.protect_gui
+    end
+    local function drawable(container)
+        if typeof(container) ~= "Instance" then return nil end
+        local depth = 0
+        while container and container:IsA("LayerCollector") and depth < 8 do
+            container = container.Parent
+            depth = depth + 1
+        end
+        if container and container:IsA("LayerCollector") then return nil end
+        return container
+    end
+
+    publish("hidegui", function(gui)
+        if guard then pcall(guard, gui) end
+        if hidden then
+            local reached, container = pcall(hidden)
+            if reached then
+                container = drawable(container)
+                if container then
+                    gui.Parent = container
+                    return
+                end
+            end
+        end
+        local pulled, core = pcall(game.GetService, game, "CoreGui")
+        if pulled and core then
+            local placed = pcall(function() gui.Parent = core end)
+            if placed then return end
+        end
+        gui.Parent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+    end)
+end
+
+bootstrapCompatibility()
+
+do
+    local genv = (type(getgenv) == "function" and getgenv()) or _G
+    for _, stale in ipairs({ "PlayerCard", "Lines" }) do
+        pcall(function()
+            if _G[stale] ~= nil then
+                _G[stale] = nil
+            end
+        end)
+    end
+    local prior = rawget(genv, "TOMBOY_COSMETIC_SESSION") or genv.TOMBOY_COSMETIC_SESSION
+    local carried = type(prior) == "table" and prior.vault or nil
+    if type(prior) == "table" and type(prior.unload) == "function" then
+        pcall(prior.unload)
+    end
+    local mt = getrawmetatable and getrawmetatable(game)
+    local pristine = mt and rawget(mt, "__namecall")
+    local history = rawget(genv, "TOMBOY_COSMETIC_TAGS")
+    if type(history) ~= "table" then
+        history = {}
+        genv.TOMBOY_COSMETIC_TAGS = history
+    end
+    local session = {}
+    session.history = history
+    session.vault = carried
+    session.unload = function()
+        if session.closed then return end
+        session.closed = true
+        if type(session.teardown) == "function" then
+            local sweep = session.teardown
+            session.teardown = nil
+            pcall(sweep)
+        end
+        if session.vault and session.vault.inventory then
+            pcall(function()
+                local Knit = require(game:GetService("ReplicatedStorage").Packages.Knit)
+                local inventory = Knit.GetController("InventoryController")
+                if inventory and inventory.Inventory then
+                    inventory.Inventory:set(session.vault.inventory)
+                end
+            end)
+        end
+        if session.ui and session.ui.Unload then
+            pcall(function()
+                session.ui:Unload()
+            end)
+        end
+        for _, link in ipairs(session.links or {}) do
+            pcall(function()
+                link:Disconnect()
+            end)
+        end
+        table.clear(session.links)
+        session.ui = nil
+        pcall(function()
+            local tagged = {}
+            for _, name in ipairs(session.tags or {}) do
+                tagged[name] = true
+            end
+            for _, name in ipairs(session.history or {}) do
+                tagged[name] = true
+            end
+            if not next(tagged) then return end
+            local holders = {}
+            if type(gethui) == "function" then
+                local reached, container = pcall(gethui)
+                if reached and container then table.insert(holders, container) end
+            end
+            table.insert(holders, game:GetService("CoreGui"))
+            local players = game:GetService("Players")
+            if players.LocalPlayer then
+                local pg = players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+                if pg then table.insert(holders, pg) end
+            end
+            if workspace.CurrentCamera then
+                table.insert(holders, workspace.CurrentCamera)
+            end
+            for _, holder in ipairs(holders) do
+                for _, child in ipairs(holder:GetChildren()) do
+                    if tagged[child.Name] then
+                        child:Destroy()
+                    end
+                end
+            end
+            for _, model in ipairs(workspace:GetChildren()) do
+                if model:IsA("Model") and model.Name:match("^CLIENT_BALL_%d+$") then
+                    for _, child in ipairs(model:GetChildren()) do
+                        if tagged[child.Name] then
+                            child:Destroy()
+                        end
+                    end
+                end
+            end
+            for _, other in ipairs(players:GetPlayers()) do
+                if other.Character then
+                    for _, child in ipairs(other.Character:GetChildren()) do
+                        if tagged[child.Name] then
+                            child:Destroy()
+                        end
+                    end
+                end
+            end
+        end)
+        if mt and pristine and session.relay and rawget(mt, "__namecall") == session.relay then
+            pcall(setreadonly, mt, false)
+            mt.__namecall = pristine
+            pcall(setreadonly, mt, true)
+        end
+    end
+    session.links = {}
+    session.tags = {}
+    session.seal = rawget(genv, "__TOMBOY_SEAL") or genv.__TOMBOY_SEAL
+    genv.TOMBOY_COSMETIC_SESSION = session
+end
+
+local Library = { Unloaded = false, Options = {}, Toggles = {}, NoSave = {}, Fonts = {}, Root = false }
+function Library:Notify() end
+function Library:GetScale() return 1 end
+
+do
+    local genv = (type(getgenv) == "function" and getgenv()) or _G
+    local session = genv.TOMBOY_COSMETIC_SESSION
+    if type(session) == "table" then
+        session.ui = Library
+        if Library.Root and type(session.tags) == "table" then
+            table.insert(session.tags, Library.Root.Name)
+            if type(session.history) == "table" then
+                table.insert(session.history, Library.Root.Name)
+            end
+        end
+    end
+end
+
+local Options = Library.Options
+local Toggles = Library.Toggles
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+local _AC
+local function readAnimationController()
+    if _AC then return _AC end
+    local reached, controller = pcall(function()
+        return require(game:GetService("ReplicatedFirst").Controllers.AnimationController)
+    end)
+    if reached then _AC = controller end
+    return _AC
+end
+
+local MARK = string.char(math.random(97, 122), math.random(97, 122), math.random(97, 122)) .. tostring(math.random(100000, 999999))
+local MARK2 = string.char(math.random(97, 122), math.random(97, 122), math.random(97, 122)) .. tostring(math.random(100000, 999999))
+
+do
+    local genv = (type(getgenv) == "function" and getgenv()) or _G
+    local session = genv.TOMBOY_COSMETIC_SESSION
+    if type(session) == "table" and type(session.tags) == "table" then
+        table.insert(session.tags, MARK)
+        table.insert(session.tags, MARK2)
+        if type(session.history) == "table" then
+            table.insert(session.history, MARK)
+            table.insert(session.history, MARK2)
+        end
+    end
+end
+
+local Human = {
+    walks = {},
+    gates = {},
+    stream = nil,
+}
+
+Human.clock = function()
+    return os.clock()
+end
+
+Human.roll = function()
+    if Human.stream == nil then
+        local ok, made = pcall(Random.new, math.floor(os.clock() * 1000000) % 2147483647)
+        Human.stream = ok and made or false
+    end
+    if Human.stream then
+        return Human.stream:NextNumber()
+    end
+    return math.random()
+end
+
+Human.spread = function(span)
+    if type(span) ~= "number" or span <= 0 then return 0 end
+    return (Human.roll() * 2 - 1) * span
+end
+
+Human.walk = function(key, span, period)
+    if type(span) ~= "number" or span <= 0 then return 0 end
+    period = (type(period) == "number" and period > 0) and period or 1.5
+    local now = Human.clock()
+    local held = Human.walks[key]
+    if held == nil then
+        held = { from = 0, to = Human.spread(span), stamp = now, span = span, period = period }
+        Human.walks[key] = held
+        return held.from
+    end
+    if held.span ~= span then
+        held.span = span
+        held.to = math.clamp(held.to, -span, span)
+    end
+    held.period = period
+    local elapsed = now - held.stamp
+    if elapsed >= period then
+        held.from = held.to
+        held.to = Human.spread(span)
+        held.stamp = now
+        elapsed = 0
+    end
+    local alpha = period > 0 and math.clamp(elapsed / period, 0, 1) or 1
+    local eased = alpha * alpha * (3 - 2 * alpha)
+    return held.from + (held.to - held.from) * eased
+end
+
+Human.band = function(key, top, depth, period)
+    local wanted = tonumber(top) or 0
+    if type(depth) ~= "number" or depth <= 0 then return wanted end
+    local offset = Human.walk(key, depth * 0.5, period) - depth * 0.5
+    return math.clamp(wanted + offset, wanted - depth, wanted)
+end
+
+Human.near = function(key, target, radius, period)
+    local wanted = tonumber(target) or 0
+    if type(radius) ~= "number" or radius <= 0 then return wanted end
+    return wanted + Human.walk(key, radius, period)
+end
+
+Human.ready = function(key, gap)
+    local last = Human.gates[key]
+    if last == nil then return true end
+    return (Human.clock() - last) >= (tonumber(gap) or 0)
+end
+
+Human.mark = function(key)
+    Human.gates[key] = Human.clock()
+end
+
+Human.gate = function(key, gap)
+    if not Human.ready(key, gap) then return false end
+    Human.mark(key)
+    return true
+end
+
+Human.forget = function()
+    Human.walks = {}
+    Human.gates = {}
+end
+
+local Restore = {
+    slots = {},
+    order = {},
+    ran = 0,
+    failed = 0,
+}
+
+Restore.attic = function()
+    local genv = (type(getgenv) == "function" and getgenv()) or _G
+    local session = genv.TOMBOY_COSMETIC_SESSION
+    if type(session) ~= "table" then return nil end
+    if type(session.vault) ~= "table" then session.vault = {} end
+    if type(session.vault.origins) ~= "table" then session.vault.origins = {} end
+    return session.vault.origins
+end
+
+Restore.remember = function(key, value)
+    local attic = Restore.attic()
+    if attic == nil then return value end
+    if attic[key] == nil then attic[key] = { held = value } end
+    return attic[key].held
+end
+
+Restore.recall = function(key)
+    local attic = Restore.attic()
+    if attic == nil then return nil end
+    local box = attic[key]
+    if box == nil then return nil end
+    return box.held
+end
+
+Restore.forget = function(key)
+    local attic = Restore.attic()
+    if attic == nil then return end
+    attic[key] = nil
+end
+
+Restore.keep = function(name, revert)
+    if type(name) ~= "string" or type(revert) ~= "function" then return false end
+    if Restore.slots[name] == nil then
+        Restore.order[#Restore.order + 1] = name
+    end
+    Restore.slots[name] = revert
+    return true
+end
+
+Restore.holds = function(name)
+    return Restore.slots[name] ~= nil
+end
+
+Restore.drop = function(name)
+    local revert = Restore.slots[name]
+    if revert == nil then return false end
+    Restore.slots[name] = nil
+    for index = #Restore.order, 1, -1 do
+        if Restore.order[index] == name then table.remove(Restore.order, index) end
+    end
+    local ok = pcall(revert)
+    Restore.ran = Restore.ran + 1
+    if not ok then Restore.failed = Restore.failed + 1 end
+    return ok
+end
+
+Restore.all = function()
+    local names = Restore.order
+    Restore.order = {}
+    local slots = Restore.slots
+    Restore.slots = {}
+    for index = #names, 1, -1 do
+        local revert = slots[names[index]]
+        if revert ~= nil then
+            local ok = pcall(revert)
+            Restore.ran = Restore.ran + 1
+            if not ok then Restore.failed = Restore.failed + 1 end
+        end
+    end
+    return Restore.ran, Restore.failed
+end
+
+local Bridge = {
+    ready = false,
+    meta = nil,
+    passthrough = nil,
+    sealed = true,
+    watch = {},
+    slots = {},
+    calls = 0,
+    edits = 0,
+    halts = 0,
+}
+
+Bridge.copy = function(value, depth, seen)
+    if type(value) ~= "table" then return value end
+    seen = seen or {}
+    if seen[value] then return seen[value] end
+    -- Refuse malformed deeply nested payloads instead of sharing mutable tails.
+    if depth > 16 then error("payload nesting limit") end
+    local out = {}
+    seen[value] = out
+    for key, held in pairs(value) do out[key] = Bridge.copy(held, depth + 1, seen) end
+    return out
+end
+
+Bridge.able = function()
+    return type(getrawmetatable) == "function"
+        and type(setreadonly) == "function"
+        and type(getnamecallmethod) == "function"
+end
+
+Bridge.arm = function()
+    if Bridge.ready then return true end
+    if not Bridge.able() then return false end
+    local reached, meta = pcall(getrawmetatable, game)
+    if not reached or type(meta) ~= "table" then return false end
+    local passthrough = rawget(meta, "__namecall")
+    if type(passthrough) ~= "function" then return false end
+
+    Bridge.meta = meta
+    Bridge.passthrough = passthrough
+    if type(isreadonly) == "function" then
+        local read, state = pcall(isreadonly, meta)
+        Bridge.sealed = (not read) or state and true or false
+    else
+        Bridge.sealed = true
+    end
+
+    local rename = type(setnamecallmethod) == "function" and setnamecallmethod or nil
+    local relay = function(self, ...)
+        local slot = Bridge.watch[self]
+        if slot == nil then return passthrough(self, ...) end
+        local method = getnamecallmethod()
+        if slot.methods[method] == nil then return passthrough(self, ...) end
+
+        local packed, mirror, touched
+        Bridge.calls = Bridge.calls + 1
+        for _, entry in ipairs(slot.chain) do
+            if entry.method == method then
+                local active, live = pcall(entry.live)
+                if active and live then
+                    -- Idle hooks allocate nothing. Each active transform gets a
+                    -- private transaction, so errors cannot leak partial edits.
+                    packed = packed or table.pack(...)
+                    local cloned, candidate = pcall(Bridge.copy, mirror or packed, 0)
+                    if cloned then
+                        local ok, changed, halt = pcall(entry.run, candidate)
+                        if ok then
+                            if type(halt) == "table" then
+                                Bridge.halts = Bridge.halts + 1
+                                return table.unpack(halt, 1, halt.n or #halt)
+                            end
+                            if changed then mirror, touched = candidate, true end
+                        end
+                    end
+                end
+            end
+        end
+        if packed and rename then rename(method) end
+        if not touched then return passthrough(self, ...) end
+        Bridge.edits = Bridge.edits + 1
+        return passthrough(self, table.unpack(mirror, 1, mirror.n))
+    end
+
+    if type(newcclosure) == "function" then
+        local wrapped, shielded = pcall(newcclosure, relay)
+        if wrapped and type(shielded) == "function" then relay = shielded end
+    end
+
+    pcall(setreadonly, meta, false)
+    meta.__namecall = relay
+    Bridge.relay = relay
+    if Bridge.sealed then pcall(setreadonly, meta, true) end
+    local holder = (type(getgenv) == "function" and getgenv()) or _G
+    local owner = rawget(holder, "TOMBOY_COSMETIC_SESSION") or holder.TOMBOY_COSMETIC_SESSION
+    if type(owner) == "table" then owner.relay = relay end
+
+    Bridge.ready = true
+    return true
+end
+
+Bridge.on = function(target, method, name, rank, live, run)
+    if target == nil or type(method) ~= "string" then return false end
+    if not Bridge.arm() then return false end
+    local slot = Bridge.watch[target]
+    if slot == nil then
+        slot = { methods = {}, chain = {} }
+        Bridge.watch[target] = slot
+    end
+    slot.methods[method] = true
+    for _, entry in ipairs(slot.chain) do
+        if entry.name == name then return true end
+    end
+    slot.chain[#slot.chain + 1] = { name = name, rank = rank, method = method, live = live, run = run }
+    table.sort(slot.chain, function(a, b)
+        if a.rank == b.rank then return a.name < b.name end
+        return a.rank < b.rank
+    end)
+    Bridge.slots[name] = target
+    return true
+end
+
+Bridge.off = function(name)
+    local target = Bridge.slots[name]
+    if target == nil then return false end
+    local slot = Bridge.watch[target]
+    Bridge.slots[name] = nil
+    if slot == nil then return false end
+    for index = #slot.chain, 1, -1 do
+        if slot.chain[index].name == name then table.remove(slot.chain, index) end
+    end
+    if #slot.chain == 0 then
+        Bridge.watch[target] = nil
+        return true
+    end
+    local methods = {}
+    for _, entry in ipairs(slot.chain) do methods[entry.method] = true end
+    slot.methods = methods
+    return true
+end
+
+Bridge.rest = function()
+    Bridge.watch = {}
+    Bridge.slots = {}
+    if not Bridge.ready then return end
+    local meta, passthrough = Bridge.meta, Bridge.passthrough
+    if meta and passthrough and rawget(meta, "__namecall") == Bridge.relay then
+        pcall(setreadonly, meta, false)
+        meta.__namecall = passthrough
+        if Bridge.sealed then pcall(setreadonly, meta, true) end
+    end
+    Bridge.ready = false
+end
+
+do
+    local genv = (type(getgenv) == "function" and getgenv()) or _G
+    local session = genv.TOMBOY_COSMETIC_SESSION
+    if type(session) == "table" then
+        session.teardown = function()
+            Restore.all()
+            Bridge.rest()
+            Human.forget()
+        end
+    end
+end
+
+local track = (function()
+    local genv = (type(getgenv) == "function" and getgenv()) or _G
+    local session = genv.TOMBOY_COSMETIC_SESSION
+    local pending = 0
+    return function(connection)
+        if type(session) ~= "table" or session.closed then
+            connection:Disconnect()
+            return connection
+        end
+        local links = session.links
+        pending = pending + 1
+        if pending >= 128 then
+            pending = 0
+            local kept = 0
+            local count = #links
+            for index = 1, count do
+                local link = links[index]
+                if link.Connected then
+                    kept = kept + 1
+                    links[kept] = link
+                end
+            end
+            for index = kept + 1, count do links[index] = nil end
+        end
+        links[#links + 1] = connection
+        return connection
+    end
+end)()
+
+local hitEffectEnabled = false
+local selectedEffect = "SupernovaScoreEffect"
+local playerCardEnabled = false
+local selectedCard = "UltimateChampionPlayerCard"
+local selectedTitle = nil
+local selectedJersey = "DragonTuxedoJersey"
+local pickedTeam = nil
+local selectedBallSkin = "ClassicBall"
+local ballSkinList = {}
+local Remote = { services = nil, cache = {} }
+
+Remote.folder = function()
+    if Remote.services and Remote.services.Parent then
+        return Remote.services
+    end
+    local node = ReplicatedStorage:FindFirstChild("Packages")
+    node = node and node:FindFirstChild("_Index")
+    node = node and node:FindFirstChild("sleitnick_knit@1.7.0")
+    node = node and node:FindFirstChild("knit")
+    node = node and node:FindFirstChild("Services")
+    Remote.services = node
+    return node
+end
+
+Remote.get = function(serviceName, kind, remoteName)
+    local key = serviceName .. "/" .. kind .. "/" .. remoteName
+    local held = Remote.cache[key]
+    if held and held.Parent then
+        return held
+    end
+    local services = Remote.folder()
+    local service = services and services:FindFirstChild(serviceName)
+    local bucket = service and service:FindFirstChild(kind)
+    local remote = bucket and bucket:FindFirstChild(remoteName)
+    Remote.cache[key] = remote
+    return remote
+end
+
+Remote.invoke = function(serviceName, remoteName, ...)
+    local remote = Remote.get(serviceName, "RF", remoteName)
+    if not remote then
+        return false, nil
+    end
+    local packed = table.pack(...)
+    Remote.sent = (Remote.sent or 0) + 1
+    local returned = table.pack(pcall(function()
+        return remote:InvokeServer(table.unpack(packed, 1, packed.n))
+    end))
+    if not returned[1] and not remote.Parent then
+        Remote.cache[serviceName .. "/RF/" .. remoteName] = nil
+    end
+    return table.unpack(returned, 1, math.max(returned.n, 2))
+end
+
+local autoApplyJersey = false
+local autoApplyBallSkin = false
+
+local originals = setmetatable({}, { __mode = "k" })
+local clones = setmetatable({}, { __mode = "k" })
+local seen = {}
+
+local BallService, EffectsRemote, GameEffectRemote
+do
+    local function reach(root, names, timeout)
+        local node = root
+        local deadline = os.clock() + timeout
+        for _, name in ipairs(names) do
+            if not node then return nil end
+            local found = node:FindFirstChild(name)
+            if not found then
+                local left = deadline - os.clock()
+                if left <= 0 then return nil end
+                found = node:WaitForChild(name, left)
+            end
+            node = found
+        end
+        return node
+    end
+    local function resolve(budget)
+        local services = reach(ReplicatedStorage, { "Packages", "_Index", "sleitnick_knit@1.7.0", "knit", "Services" }, budget * 2)
+        local ball = BallService or (services and reach(services, { "BallService" }, budget))
+        BallService = ball
+        EffectsRemote = EffectsRemote or (ball and reach(ball, { "RE", "Effects" }, budget))
+        GameEffectRemote = GameEffectRemote or (services and reach(services, { "GameService", "RE", "Effect" }, budget))
+        return BallService ~= nil and EffectsRemote ~= nil and GameEffectRemote ~= nil
+    end
+    if not resolve(0) then
+        task.spawn(resolve, 15)
+    end
+end
+
+local Nick = {
+    enabled = false,
+    name = "",
+    realName = LocalPlayer.Name,
+    realDisplay = LocalPlayer.DisplayName,
+    savedDisplay = nil,
+    recursive = false,
+    gen = 0,
+    chunk = 300,
+    links = {},
+    extra = {},
+    painted = setmetatable({}, { __mode = "k" }),
+}
+
+Nick.wordish = function(byte)
+    if not byte then return false end
+    return (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95
+end
+
+Nick.style = function(text)
+    local upper, lower = string.upper(text), string.lower(text)
+    if upper == lower then return "none" end
+    if text == upper then return "upper" end
+    if text == lower then return "lower" end
+    return "mixed"
+end
+
+Nick.cased = function(found, swap, target)
+    local shape = Nick.style(found)
+    if shape == "none" or shape == "mixed" then return swap end
+    if shape == Nick.style(target) then return swap end
+    if shape == "upper" then return string.upper(swap) end
+    return string.lower(swap)
+end
+
+Nick.replace = function(text, target, swap)
+    if target == nil or target == "" then return text end
+    local hay, needle = string.lower(text), string.lower(target)
+    local out, at, size = "", 1, #text
+    while true do
+        local head, tail = string.find(hay, needle, at, true)
+        if not head then
+            out = out .. string.sub(text, at)
+            break
+        end
+        local before = head > 1 and string.byte(text, head - 1) or nil
+        local after = tail < size and string.byte(text, tail + 1) or nil
+        if Nick.wordish(before) or Nick.wordish(after) then
+            out = out .. string.sub(text, at, tail)
+        else
+            out = out .. string.sub(text, at, head - 1) .. Nick.cased(string.sub(text, head, tail), swap, target)
+        end
+        at = tail + 1
+    end
+    return out
+end
+
+Nick.nameSwap = function(text)
+    if not Nick.enabled or Nick.name == "" or Nick.recursive then return text end
+    local out = Nick.replace(text, Nick.realName, Nick.name)
+    if Nick.realDisplay ~= Nick.realName then
+        out = Nick.replace(out, Nick.realDisplay, Nick.name)
+    end
+    return out
+end
+
+Nick.swap = function(text, node)
+    if type(text) ~= "string" or text == "" then return text end
+    local out = Nick.nameSwap(text)
+    for _, unit in ipairs(Nick.extra) do
+        if unit.live() then
+            local ok, made = pcall(unit.run, out, node)
+            if ok and type(made) == "string" then out = made end
+        end
+    end
+    return out
+end
+
+Nick.busy = function()
+    for _, unit in ipairs(Nick.extra) do
+        if unit.live() then return true end
+    end
+    return false
+end
+
+Nick.textual = function()
+    if Nick.enabled and Nick.name ~= "" and not Nick.recursive then return true end
+    return Nick.busy()
+end
+
+Nick.record = function(label)
+    local held = Nick.painted[label]
+    if held then return held end
+    held = {}
+    Nick.painted[label] = held
+    return held
+end
+
+Nick.brush = function(label)
+    if not Nick.textual() then return end
+    local ok, text = pcall(function() return label.Text end)
+    if not ok or type(text) ~= "string" then return end
+    local wanted = Nick.swap(text, label)
+    if wanted == text then return end
+    if Nick.mine(label) then return end
+    local held = Nick.record(label)
+    held.original = text
+    held.applied = wanted
+    pcall(function() label.Text = wanted end)
+end
+
+Nick.bind = function(label)
+    local held = Nick.record(label)
+    if held.link then return end
+    local ok, link = pcall(function()
+        return label:GetPropertyChangedSignal("Text"):Connect(function()
+            Nick.brush(label)
+            task.defer(Nick.brush, label)
+        end)
+    end)
+    if ok then held.link = link end
+end
+
+Nick.spare = {}
+
+Nick.mine = function(node)
+    local roots = { Library and Library.Root }
+    for _, extra in ipairs(Nick.spare) do roots[#roots + 1] = extra end
+    for _, root in ipairs(roots) do
+        if root ~= nil then
+            local ok, inside = pcall(function()
+                return node:IsDescendantOf(root)
+            end)
+            if ok and inside then return true end
+        end
+    end
+    return false
+end
+
+Nick.paintable = function(node)
+    local class = node.ClassName
+    if class ~= "TextLabel" and class ~= "TextButton" then return false end
+    if node.Name == "DisplayName" then
+        local parent = node.Parent
+        if parent ~= nil and parent.Name == "TopPanel" then return false end
+    end
+    return true
+end
+
+Nick.sweep = function(root)
+    if root == nil then return end
+    local gen = Nick.gen
+    task.spawn(function()
+        local ok, list = pcall(function() return root:GetDescendants() end)
+        if not ok then return end
+        local seen = 0
+        for _, node in ipairs(list) do
+            if gen ~= Nick.gen or not Nick.textual() then return end
+            if Nick.paintable(node) then
+                Nick.bind(node)
+                Nick.brush(node)
+            end
+            seen = seen + 1
+            if seen % Nick.chunk == 0 then task.wait() end
+        end
+    end)
+end
+
+Nick.follow = function(root)
+    if root == nil then return end
+    local ok, link = pcall(function()
+        return root.DescendantAdded:Connect(function(node)
+            if not Nick.textual() then return end
+            if not Nick.paintable(node) then return end
+            Nick.bind(node)
+            Nick.brush(node)
+            task.defer(Nick.brush, node)
+        end)
+    end)
+    if ok and link then Nick.links[#Nick.links + 1] = track(link) end
+    Nick.sweep(root)
+end
+
+Nick.unlink = function()
+    for _, link in ipairs(Nick.links) do
+        pcall(link.Disconnect, link)
+    end
+    Nick.links = {}
+end
+
+Nick.strip = function()
+    for label, held in pairs(Nick.painted) do
+        if held.link then pcall(held.link.Disconnect, held.link) end
+        if held.applied ~= nil then
+            local ok, current = pcall(function() return label.Text end)
+            if ok and current == held.applied then
+                pcall(function() label.Text = held.original end)
+            end
+        end
+    end
+    Nick.painted = setmetatable({}, { __mode = "k" })
+end
+
+Nick.layers = function()
+    local found = {}
+    local reached, core = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if reached and core then found[#found + 1] = core end
+    if type(gethui) == "function" then
+        local ok, hidden = pcall(gethui)
+        if ok and hidden and hidden ~= core then
+            local nested = false
+            if core then
+                local walked, inside = pcall(function()
+                    return hidden:IsDescendantOf(core)
+                end)
+                nested = walked and inside or false
+            end
+            if not nested then found[#found + 1] = hidden end
+        end
+    end
+    return found
+end
+
+Nick.watch = function()
+    Nick.gen = Nick.gen + 1
+    Nick.unlink()
+    if not Nick.textual() then return end
+    Nick.follow(LocalPlayer:FindFirstChildOfClass("PlayerGui"))
+    Nick.follow(LocalPlayer.Character)
+    Nick.follow(Workspace)
+    for _, layer in ipairs(Nick.layers()) do
+        Nick.follow(layer)
+    end
+end
+
+Nick.wear = function()
+    if not Nick.enabled or Nick.name == "" then return end
+    if Nick.savedDisplay == nil then Nick.savedDisplay = LocalPlayer.DisplayName end
+    pcall(function()
+        LocalPlayer.DisplayName = Nick.name
+    end)
+end
+
+Nick.release = function()
+    Nick.gen = Nick.gen + 1
+    Nick.unlink()
+    Nick.strip()
+    if Nick.savedDisplay ~= nil then
+        pcall(function()
+            LocalPlayer.DisplayName = Nick.savedDisplay
+        end)
+        Nick.savedDisplay = nil
+    end
+end
+
+Nick.setName = function(text)
+    text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    Nick.name = text:sub(1, 20)
+    Nick.recursive = false
+    if Nick.name ~= "" then
+        local probe = Nick.replace(Nick.name, Nick.realName, Nick.name)
+        if Nick.realDisplay ~= Nick.realName then
+            probe = Nick.replace(probe, Nick.realDisplay, Nick.name)
+        end
+        Nick.recursive = probe ~= Nick.name
+    end
+    if not Nick.enabled then return end
+    if Nick.name == "" then
+        Nick.release()
+        return
+    end
+    Nick.strip()
+    Nick.wear()
+    Nick.watch()
+end
+
+Nick.setEnabled = function(state)
+    Nick.enabled = state and true or false
+    if Nick.enabled then
+        Nick.wear()
+        Nick.watch()
+        Restore.keep("nick", function()
+            Nick.enabled = false
+            Nick.release()
+        end)
+        return
+    end
+    Restore.drop("nick")
+    Nick.release()
+    if Nick.busy() then
+        Nick.watch()
+    end
+end
+
+track(LocalPlayer.CharacterAdded:Connect(function()
+    if not Nick.textual() then return end
+    task.delay(1, function()
+        if not Nick.textual() then return end
+        Nick.wear()
+        Nick.sweep(LocalPlayer.Character)
+    end)
+end))
+
+local Level = {
+    enabled = false,
+    shown = 100,
+    words = { "[Ll][Ee][Vv][Ee][Ll]", "[Ll][Vv][Ll]", "[Ll][Vv]" },
+}
+
+Level.live = function()
+    return Level.enabled and Level.shown > 0
+end
+
+Level.wanted = function()
+    return tostring(math.floor(Level.shown))
+end
+
+Level.named = function(node)
+    if node == nil then return false end
+    local ok, mine = pcall(function() return node.Name end)
+    if not ok then return false end
+    local reached, theirs = pcall(function()
+        local parent = node.Parent
+        return parent and parent.Name or ""
+    end)
+    if not reached then theirs = "" end
+    local hay = string.lower(tostring(mine) .. " " .. tostring(theirs))
+    return string.find(hay, "level", 1, true) ~= nil or string.find(hay, "lvl", 1, true) ~= nil
+end
+
+Level.rewrite = function(text, node)
+    local want = Level.wanted()
+    local out = text
+    for _, word in ipairs(Level.words) do
+        out = string.gsub(out, "(%f[%a]" .. word .. "%s*[%.:#]?%s*)%d+", "%1" .. want)
+    end
+    if out ~= text then return out end
+    if string.match(text, "^%s*%d+%s*$") and Level.named(node) then
+        return (string.gsub(text, "%d+", want))
+    end
+    return out
+end
+
+Nick.extra[#Nick.extra + 1] = { live = Level.live, run = Level.rewrite }
+
+Level.repaint = function()
+    Nick.strip()
+    Nick.watch()
+end
+
+Level.setShown = function(value)
+    Level.shown = math.clamp(math.floor(tonumber(value) or 1), 1, 9999)
+    if Level.enabled then Level.repaint() end
+end
+
+Level.setEnabled = function(state)
+    Level.enabled = state and true or false
+    if Level.enabled then
+        Level.repaint()
+        Restore.keep("level", function()
+            Level.enabled = false
+            Level.repaint()
+        end)
+        return
+    end
+    Restore.drop("level")
+    Level.repaint()
+end
+
+local Avatar = {
+    busy = false,
+    token = 0,
+    fetchGen = 0,
+    applied = {},
+    ownedColors = nil,
+    saved = nil,
+    cache = {},
+    cacheOrder = {},
+    packs = {},
+    packOrder = {},
+    cacheCap = 120,
+    scaleKeys = { "BodyDepthScale", "BodyHeightScale", "BodyWidthScale", "HeadScale", "BodyProportionScale", "BodyTypeScale" },
+    scaleFields = {
+        BodyDepthScale = "DepthScale",
+        BodyHeightScale = "HeightScale",
+        BodyWidthScale = "WidthScale",
+        HeadScale = "HeadScale",
+        BodyProportionScale = "ProportionScale",
+        BodyTypeScale = "BodyTypeScale",
+    },
+}
+
+Avatar.character = function()
+    local char = LocalPlayer.Character
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    return char, humanoid
+end
+
+Avatar.alive = function(char)
+    return char ~= nil and char.Parent ~= nil and char == LocalPlayer.Character
+end
+
+Avatar.wearable = function(item)
+    return item:IsA("Accoutrement") or item:IsA("Shirt") or item:IsA("Pants")
+        or item:IsA("ShirtGraphic") or item:IsA("Decal")
+end
+
+Avatar.modernise = function(item)
+    if not item:IsA("Hat") then return item end
+    local swap = Instance.new("Accessory")
+    swap.Name = item.Name
+    swap.AttachmentPoint = item.AttachmentPoint
+    for _, node in ipairs(item:GetChildren()) do
+        node.Parent = swap
+    end
+    pcall(function() item:Destroy() end)
+    return swap
+end
+
+Avatar.firstOf = function(pack, class)
+    if pack:IsA(class) then return pack end
+    for _, node in ipairs(pack:GetDescendants()) do
+        if node:IsA(class) then return node end
+    end
+    return nil
+end
+
+Avatar.allOf = function(pack, class)
+    local found = {}
+    if pack:IsA(class) then found[#found + 1] = pack end
+    for _, node in ipairs(pack:GetDescendants()) do
+        if node:IsA(class) then found[#found + 1] = node end
+    end
+    return found
+end
+
+Avatar.fetchPack = function(assetId)
+    local id = math.floor(tonumber(assetId) or 0)
+    if id <= 0 then return nil end
+    local held = Avatar.packs[id]
+    if held then return held:Clone() end
+    local ok, objects = pcall(function()
+        return game:GetObjects("rbxassetid://" .. tostring(id))
+    end)
+    if not ok or type(objects) ~= "table" or #objects == 0 then return nil end
+    local pack = Instance.new("Folder")
+    pack.Name = "pack"
+    for _, object in ipairs(objects) do
+        object.Parent = pack
+    end
+    Avatar.packs[id] = pack:Clone()
+    Avatar.packOrder[#Avatar.packOrder + 1] = id
+    while #Avatar.packOrder > Avatar.cacheCap do
+        local oldest = table.remove(Avatar.packOrder, 1)
+        local stale = Avatar.packs[oldest]
+        if stale then
+            pcall(function() stale:Destroy() end)
+            Avatar.packs[oldest] = nil
+        end
+    end
+    return pack
+end
+
+Avatar.remember = function(id, item)
+    Avatar.cache[id] = item:Clone()
+    Avatar.cacheOrder[#Avatar.cacheOrder + 1] = id
+    while #Avatar.cacheOrder > Avatar.cacheCap do
+        local oldest = table.remove(Avatar.cacheOrder, 1)
+        local held = Avatar.cache[oldest]
+        if held then
+            pcall(function() held:Destroy() end)
+            Avatar.cache[oldest] = nil
+        end
+    end
+end
+
+Avatar.fetch = function(assetId)
+    local id = math.floor(tonumber(assetId) or 0)
+    if id <= 0 then return nil end
+    local held = Avatar.cache[id]
+    if held then return held:Clone() end
+
+    local ok, objects = pcall(function()
+        return game:GetObjects("rbxassetid://" .. tostring(id))
+    end)
+    if not ok or type(objects) ~= "table" or #objects == 0 then return nil end
+
+    local item = nil
+    for _, object in ipairs(objects) do
+        if Avatar.wearable(object) then
+            item = object
+            break
+        end
+    end
+    if not item then
+        for _, object in ipairs(objects) do
+            for _, node in ipairs(object:GetDescendants()) do
+                if Avatar.wearable(node) then
+                    item = node
+                    break
+                end
+            end
+            if item then break end
+        end
+        if item then item.Parent = nil end
+    end
+    for _, object in ipairs(objects) do
+        if object ~= item then pcall(function() object:Destroy() end) end
+    end
+    if not item then return nil end
+
+    Avatar.remember(id, item)
+    return item
+end
+
+Avatar.attachmentIndex = function(char)
+    local index = {}
+    for _, part in ipairs(char:GetChildren()) do
+        if part:IsA("BasePart") then
+            for _, node in ipairs(part:GetChildren()) do
+                if node:IsA("Attachment") and index[node.Name] == nil then
+                    index[node.Name] = node
+                end
+            end
+        end
+    end
+    return index
+end
+
+Avatar.attach = function(char, index, item, puffiness)
+    local handle = item:FindFirstChild("Handle")
+    if not handle or not handle:IsA("BasePart") then return false end
+    for _, joint in ipairs(handle:GetChildren()) do
+        if joint:IsA("Weld") or joint:IsA("WeldConstraint") or joint:IsA("Motor6D") then
+            joint:Destroy()
+        end
+    end
+    handle.CanCollide = false
+    handle.CanQuery = false
+    handle.CanTouch = false
+    handle.Massless = true
+    handle.Anchored = false
+
+    local layer = handle:FindFirstChildWhichIsA("WrapLayer")
+    if layer and puffiness then
+        pcall(function() layer.Puffiness = puffiness end)
+    end
+
+    local socket = handle:FindFirstChildOfClass("Attachment")
+    local target = socket and index[socket.Name] or nil
+    local weld = Instance.new("Weld")
+    weld.Name = "AccessoryWeld"
+    weld.Part1 = handle
+    if target and target.Parent and target.Parent:IsA("BasePart") then
+        weld.Part0 = target.Parent
+        weld.C0 = target.CFrame
+        weld.C1 = socket.CFrame
+    elseif layer then
+        local anchor = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+        if not anchor then return false end
+        weld.Part0 = anchor
+        weld.C0 = CFrame.new()
+        weld.C1 = CFrame.new()
+    else
+        local head = char:FindFirstChild("Head")
+        if not head then return false end
+        weld.Part0 = head
+        weld.C0 = CFrame.new(0, head.Size.Y * 0.5, 0)
+        weld.C1 = item.AttachmentPoint
+    end
+    weld.Parent = handle
+    return true
+end
+
+Avatar.readScale = function(humanoid)
+    local values = {}
+    if not humanoid then return values end
+    for _, name in ipairs(Avatar.scaleKeys) do
+        local node = humanoid:FindFirstChild(name)
+        if node and node:IsA("NumberValue") then values[name] = node.Value end
+    end
+    return values
+end
+
+Avatar.writeScale = function(humanoid, values)
+    if not humanoid or type(values) ~= "table" then return end
+    for name, value in pairs(values) do
+        local node = humanoid:FindFirstChild(name)
+        local wanted = tonumber(value)
+        if node and node:IsA("NumberValue") and wanted then
+            pcall(function() node.Value = wanted end)
+        end
+    end
+end
+
+Avatar.snapshot = function(char, humanoid)
+    if Avatar.saved then return end
+    local saved = { clothes = {}, accessories = {}, face = nil, colors = nil, headTexture = nil, scale = Avatar.readScale(humanoid) }
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("Shirt") or child:IsA("Pants") or child:IsA("ShirtGraphic") then
+            saved.clothes[#saved.clothes + 1] = child:Clone()
+        elseif child:IsA("Accoutrement") then
+            saved.accessories[#saved.accessories + 1] = child:Clone()
+        elseif child:IsA("BodyColors") then
+            saved.colors = child:Clone()
+        end
+    end
+    local head = char:FindFirstChild("Head")
+    if head then
+        local face = head:FindFirstChildOfClass("Decal")
+        saved.face = face and face:Clone() or nil
+        if head:IsA("MeshPart") then saved.headTexture = head.TextureID end
+    end
+    Avatar.saved = saved
+end
+
+Avatar.strip = function(char)
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("Shirt") or child:IsA("Pants") or child:IsA("ShirtGraphic") or child:IsA("Accoutrement") then
+            child:Destroy()
+        end
+    end
+    local head = char:FindFirstChild("Head")
+    if head then
+        for _, node in ipairs(head:GetChildren()) do
+            if node:IsA("Decal") then node:Destroy() end
+        end
+    end
+end
+
+Avatar.clearApplied = function()
+    for _, item in ipairs(Avatar.applied) do
+        pcall(function() item:Destroy() end)
+    end
+    Avatar.applied = {}
+end
+
+Avatar.dropOwnedColors = function(char)
+    local owned = Avatar.ownedColors
+    Avatar.ownedColors = nil
+    if owned then
+        pcall(function() owned:Destroy() end)
+        return
+    end
+    if char then
+        local stray = char:FindFirstChild(MARK)
+        if stray and stray:IsA("BodyColors") then stray:Destroy() end
+    end
+end
+
+Avatar.redress = function(char, humanoid)
+    local saved = Avatar.saved
+    if not saved or not Avatar.alive(char) then return 0 end
+    Avatar.strip(char)
+    Avatar.dropOwnedColors(char)
+    local index = Avatar.attachmentIndex(char)
+    for _, cloth in ipairs(saved.clothes) do
+        cloth:Clone().Parent = char
+    end
+    local head = char:FindFirstChild("Head")
+    if head then
+        if saved.face then saved.face:Clone().Parent = head end
+        if saved.headTexture and head:IsA("MeshPart") then
+            pcall(function() head.TextureID = saved.headTexture end)
+        end
+    end
+    if saved.colors then
+        local current = char:FindFirstChildOfClass("BodyColors")
+        if current then current:Destroy() end
+        saved.colors:Clone().Parent = char
+    end
+    local back, failed = 0, 0
+    for _, accessory in ipairs(saved.accessories) do
+        local copy = accessory:Clone()
+        if Avatar.attach(char, index, copy, nil) then
+            copy.Parent = char
+            back = back + 1
+        else
+            copy:Destroy()
+            failed = failed + 1
+        end
+    end
+    Avatar.writeScale(humanoid, saved.scale)
+    return back, failed
+end
+
+Avatar.restore = function()
+    Avatar.token = Avatar.token + 1
+    Avatar.fetchGen = Avatar.fetchGen + 1
+    Avatar.busy = false
+    local char, humanoid = Avatar.character()
+    local saved = Avatar.saved
+    Avatar.clearApplied()
+    if not char or not saved then
+        Avatar.dropOwnedColors(char)
+        Avatar.saved = nil
+        return false, "Nothing to restore"
+    end
+
+    local back, failed = Avatar.redress(char, humanoid)
+    if failed == nil then
+        return false, "Could not put your avatar back yet, try again"
+    end
+    if failed > 0 then
+        return true, string.format("Your avatar is back, %d on, %d would not re-attach", back, failed)
+    end
+    Avatar.saved = nil
+    return true, string.format("Your own avatar is back, %d pieces", back)
+end
+
+track(LocalPlayer.CharacterAdded:Connect(function()
+    Avatar.token = Avatar.token + 1
+    Avatar.fetchGen = Avatar.fetchGen + 1
+    Avatar.busy = false
+    Avatar.saved = nil
+    Avatar.applied = {}
+    Avatar.ownedColors = nil
+end))
+
+local Closet = {
+    file = "Tomboy/closet.json",
+    gap = 0.35,
+    cool = 20,
+    coolUntil = 0,
+    lastAt = 0,
+    strikes = 0,
+    limit = 30,
+    keyword = "",
+    store = "All",
+    slot = "All",
+    cursor = nil,
+    results = {},
+    labels = {},
+    names = {},
+    kinds = {},
+    types = {},
+    bundles = {},
+    health = {},
+    undo = {},
+    deep = nil,
+    worn = {},
+    presets = nil,
+    status = "idle",
+}
+
+Closet.CONTROL = "https://catalog.roblox.com/v1/search/items?category=Accessories&limit=10"
+
+Closet.STORE = {
+    All = "All",
+    Front = "",
+    Accessories = "Accessories",
+    Clothing = "Clothing",
+    ["Body Parts"] = "BodyParts",
+    Gear = "Gear",
+    Limiteds = "Collectibles",
+    Featured = "Featured",
+    Community = "CommunityCreations",
+}
+
+Closet.STORE_ORDER = { "All", "Front", "Accessories", "Clothing", "Body Parts", "Gear", "Limiteds", "Featured", "Community" }
+
+Closet.TYPE_NAME = {
+    [2] = "T-Shirt",
+    [8] = "Hat",
+    [11] = "Shirt",
+    [12] = "Pants",
+    [17] = "Head",
+    [18] = "Face",
+    [19] = "Gear",
+    [27] = "Torso",
+    [28] = "R Arm",
+    [29] = "L Arm",
+    [30] = "L Leg",
+    [31] = "R Leg",
+    [41] = "Hair",
+    [42] = "Face",
+    [43] = "Neck",
+    [44] = "Shoulder",
+    [45] = "Front",
+    [46] = "Back",
+    [47] = "Waist",
+    [57] = "Jacket",
+    [58] = "Sweater",
+    [64] = "Layer Tee",
+    [65] = "Layer Shirt",
+    [66] = "Layer Pants",
+    [67] = "Layer Jacket",
+    [68] = "Layer Sweater",
+    [69] = "Shorts",
+    [70] = "L Shoe",
+    [71] = "R Shoe",
+    [72] = "Dress",
+    [76] = "Eyebrow",
+    [77] = "Eyelash",
+    [79] = "Head",
+}
+
+Closet.HIDE = {
+    [24] = true,
+    [48] = true,
+    [49] = true,
+    [50] = true,
+    [51] = true,
+    [52] = true,
+    [53] = true,
+    [54] = true,
+    [55] = true,
+    [56] = true,
+    [61] = true,
+    [78] = true,
+}
+
+Closet.hidden = function(id)
+    return Closet.HIDE[Closet.types[id] or 0] == true
+end
+
+Closet.forget = function(id)
+    for slot, held in ipairs(Closet.results) do
+        if held == id then
+            table.remove(Closet.results, slot)
+            table.remove(Closet.labels, slot)
+            return slot
+        end
+    end
+    return nil
+end
+
+Closet.kindOf = function(id)
+    return Closet.kinds[id] or "Asset"
+end
+
+Closet.typeLabel = function(id)
+    if Closet.kindOf(id) == "Bundle" then return "Bundle" end
+    local kind = Closet.types[id]
+    if kind == nil then return "Asset" end
+    return Closet.TYPE_NAME[kind] or ("Type " .. tostring(kind))
+end
+
+Closet.thumbOf = function(id)
+    local shape = Closet.kindOf(id) == "Bundle" and "BundleThumbnail" or "Asset"
+    return "rbxthumb://type=" .. shape .. "&id=" .. tostring(id) .. "&w=150&h=150"
+end
+
+Closet.SLOTS = {
+    All = "",
+    Hat = "hat",
+    Hair = "hair",
+    Face = "face",
+    Neck = "neck",
+    Shoulder = "shoulder",
+    Front = "front",
+    Back = "back",
+    Waist = "waist",
+}
+
+Closet.ORDER = { "All", "Hat", "Hair", "Face", "Neck", "Shoulder", "Front", "Back", "Waist" }
+
+Closet.io = function()
+    local write = rawget(_G, "writefile") or writefile
+    local read = rawget(_G, "readfile") or readfile
+    local exists = rawget(_G, "isfile") or isfile
+    if type(write) ~= "function" or type(read) ~= "function" or type(exists) ~= "function" then
+        return nil
+    end
+    return { write = write, read = read, exists = exists }
+end
+
+Closet.get = function(url, isControl)
+    local now = os.clock()
+    if now < Closet.coolUntil then
+        return nil, string.format("Roblox is rate limiting, %d seconds left", math.ceil(Closet.coolUntil - now))
+    end
+    local hold = Closet.gap - (now - Closet.lastAt)
+    if hold > 0 then task.wait(hold) end
+    Closet.lastAt = os.clock()
+    local reached, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if not reached or type(body) ~= "string" or body == "" then
+        if isControl then return nil, "empty" end
+        local proof = Closet.get(Closet.CONTROL, true)
+        if proof then
+            Closet.strikes = 0
+            return nil, "Roblox turned that filter down", true
+        end
+        Closet.strikes = Closet.strikes + 1
+        if Closet.strikes >= 2 then
+            Closet.coolUntil = os.clock() + Closet.cool
+            return nil, string.format("Roblox is rate limiting, retry opens in %d seconds", Closet.cool)
+        end
+        return nil, "Roblox sent an empty reply, give that another go"
+    end
+    Closet.strikes = 0
+    Closet.coolUntil = 0
+    local read, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(body)
+    end)
+    if not read or type(data) ~= "table" then
+        return nil, "The catalogue sent something unreadable"
+    end
+    return data
+end
+
+Closet.shortName = function(id)
+    return Closet.names[id] or ("asset " .. tostring(id))
+end
+
+Closet.bundleAssets = function(id)
+    local held = Closet.bundles[id]
+    if held then return held end
+    local data = Closet.get("https://catalog.roblox.com/v1/bundles/" .. tostring(id) .. "/details")
+    local ids = {}
+    if type(data) == "table" then
+        if type(data.name) == "string" then Closet.names[id] = data.name end
+        if type(data.items) == "table" then
+            for _, row in ipairs(data.items) do
+                local inner = math.floor(tonumber(row.id) or 0)
+                if row.type == "Asset" and inner > 0 then
+                    ids[#ids + 1] = inner
+                end
+            end
+        end
+    end
+    Closet.bundles[id] = ids
+    return ids
+end
+
+Closet.nameOf = function(id)
+    local held = Closet.names[id]
+    if held then return held end
+    if Closet.kindOf(id) == "Bundle" then
+        Closet.bundleAssets(id)
+        local label = Closet.names[id] or ("Bundle " .. tostring(id))
+        Closet.names[id] = label
+        return label
+    end
+    local data = Closet.get("https://economy.roblox.com/v2/assets/" .. tostring(id) .. "/details")
+    local label = data and type(data.Name) == "string" and data.Name or ("Asset " .. tostring(id))
+    Closet.names[id] = label
+    local kind = data and math.floor(tonumber(data.AssetTypeId) or 0) or 0
+    if kind > 0 then Closet.types[id] = kind end
+    return label
+end
+
+Closet.buildUrl = function(section, more)
+    local url = "https://catalog.roblox.com/v1/search/items?limit=" .. tostring(Closet.limit)
+    if section ~= nil and section ~= "" then
+        url = url .. "&category=" .. section
+    end
+    local word = tostring(Closet.keyword or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if word == "" then
+        word = Closet.SLOTS[Closet.slot] or ""
+    end
+    if word ~= "" then
+        url = url .. "&keyword=" .. game:GetService("HttpService"):UrlEncode(word)
+    end
+    if more and Closet.cursor then
+        url = url .. "&cursor=" .. Closet.cursor
+    end
+    return url
+end
+
+Closet.search = function(more)
+    local section = Closet.STORE[Closet.store]
+    if section == nil then section = "" end
+
+    local data, why, rejected = Closet.get(Closet.buildUrl(section, more))
+    local fellBack = false
+    if not data and rejected and section ~= "" then
+        Closet.health[Closet.store] = false
+        data, why = Closet.get(Closet.buildUrl("", more))
+        fellBack = data ~= nil
+    end
+    if not data then
+        Closet.status = why
+        return false, why
+    end
+    if section ~= "" and not fellBack then
+        Closet.health[Closet.store] = true
+    end
+
+    if type(data.data) ~= "table" or #data.data == 0 then
+        Closet.status = "nothing found"
+        if not more then
+            Closet.results = {}
+            Closet.labels = {}
+            Closet.kinds = {}
+        end
+        return false, "Nothing found for that search"
+    end
+
+    Closet.cursor = type(data.nextPageCursor) == "string" and data.nextPageCursor or nil
+    local from = #Closet.results + 1
+    if not more then
+        Closet.results = {}
+        Closet.labels = {}
+        Closet.kinds = {}
+        from = 1
+    end
+    for _, entry in ipairs(data.data) do
+        local id = math.floor(tonumber(entry.id) or 0)
+        if id > 0 and Closet.kinds[id] == nil then
+            Closet.kinds[id] = entry.itemType == "Bundle" and "Bundle" or "Asset"
+            Closet.results[#Closet.results + 1] = id
+        end
+    end
+
+    for slot = from, #Closet.results do
+        local id = Closet.results[slot]
+        Closet.labels[slot] = (Closet.names[id] or "loading") .. "  #" .. tostring(id)
+    end
+
+    if fellBack then
+        Closet.status = string.format("%d found, %s is closed so this is the store front", #Closet.results, Closet.store)
+    else
+        Closet.status = string.format("%d in %s", #Closet.results, Closet.store)
+    end
+    return true, Closet.status, from
+end
+
+Closet.fillNames = function(onUpdate)
+    local gen = (Closet.nameGen or 0) + 1
+    Closet.nameGen = gen
+    task.spawn(function()
+        local slot = 1
+        while slot <= #Closet.results do
+            if gen ~= Closet.nameGen then return end
+            while os.clock() < Closet.coolUntil do
+                if gen ~= Closet.nameGen then return end
+                task.wait(0.5)
+            end
+            local id = Closet.results[slot]
+            if Closet.names[id] == nil then
+                Closet.nameOf(id)
+            end
+            if gen ~= Closet.nameGen then return end
+            if Closet.hidden(id) then
+                Closet.forget(id)
+                if type(onUpdate) == "function" then
+                    pcall(onUpdate, id, slot, true)
+                end
+            else
+                Closet.labels[slot] = (Closet.names[id] or "unknown") .. "  #" .. tostring(id)
+                if type(onUpdate) == "function" then
+                    pcall(onUpdate, id, slot)
+                end
+                slot = slot + 1
+            end
+        end
+    end)
+end
+
+Closet.idFrom = function(label)
+    if type(label) ~= "string" then return nil end
+    local tail = label:match("#(%d+)%s*$")
+    return tail and math.floor(tonumber(tail)) or nil
+end
+
+Closet.shed = function(item)
+    if item == nil then return end
+    if type(item) == "table" and type(item.revert) == "function" then
+        pcall(item.revert)
+        return
+    end
+    pcall(function() item:Destroy() end)
+end
+
+Closet.recordFace = function(head)
+    if Closet.faceWas then return end
+    Closet.faceWas = {}
+    for _, node in ipairs(head:GetChildren()) do
+        if node:IsA("Decal") or node:IsA("Texture") then
+            Closet.faceWas[#Closet.faceWas + 1] = node
+        end
+    end
+    local skin = head:FindFirstChildOfClass("SurfaceAppearance")
+    Closet.faceSkin = skin
+    if head:IsA("MeshPart") then
+        Closet.faceTexture = head.TextureID
+    end
+end
+
+Closet.restoreFace = function()
+    local char = Avatar.character()
+    local head = char and char:FindFirstChild("Head")
+    if not head then
+        Closet.faceWas = nil
+        return
+    end
+    if Closet.faceSkin then
+        pcall(function() Closet.faceSkin.Parent = head end)
+        Closet.faceSkin = nil
+    end
+    if Closet.faceTexture ~= nil and head:IsA("MeshPart") then
+        pcall(function() head.TextureID = Closet.faceTexture end)
+        Closet.faceTexture = nil
+    end
+    for _, node in ipairs(Closet.faceWas or {}) do
+        pcall(function() node.Parent = head end)
+    end
+    Closet.faceWas = nil
+end
+
+Closet.wearFace = function(char, item)
+    local head = char:FindFirstChild("Head")
+    if not head then return false, "No head to put a face on" end
+    Closet.recordFace(head)
+    for _, node in ipairs(Closet.faceWas or {}) do
+        if node ~= item then pcall(function() node.Parent = nil end) end
+    end
+    if Closet.faceSkin then
+        pcall(function() Closet.faceSkin.Parent = nil end)
+    end
+    if head:IsA("MeshPart") then
+        pcall(function() head.TextureID = "" end)
+    end
+    item.Name = "face"
+    item.Parent = head
+    return true
+end
+
+Closet.gripHand = function(char)
+    local hand = char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm")
+    if not hand or not hand:IsA("BasePart") then return nil, nil end
+    return hand, hand:FindFirstChild("RightGripAttachment")
+end
+
+Closet.settle = function(part)
+    part.Anchored = false
+    part.CanCollide = false
+    part.CanQuery = false
+    part.CanTouch = false
+    part.Massless = true
+end
+
+Closet.wearTool = function(char, id, tool)
+    for _, node in ipairs(tool:GetDescendants()) do
+        if node:IsA("BaseScript") then
+            pcall(function() node:Destroy() end)
+        end
+    end
+
+    local handle = tool:FindFirstChild("Handle")
+    local hand, socket = Closet.gripHand(char)
+    if not handle or not handle:IsA("BasePart") or not hand then
+        tool.Parent = char
+        Closet.worn[id] = tool
+        return true, "Holding " .. Closet.shortName(id)
+    end
+
+    local spread = {}
+    for _, part in ipairs(tool:GetDescendants()) do
+        if part:IsA("BasePart") then
+            spread[#spread + 1] = { part = part, offset = handle.CFrame:ToObjectSpace(part.CFrame) }
+        end
+    end
+    for _, row in ipairs(spread) do
+        for _, joint in ipairs(row.part:GetChildren()) do
+            if joint:IsA("Weld") or joint:IsA("WeldConstraint") or joint:IsA("Motor6D") then
+                pcall(function() joint:Destroy() end)
+            end
+        end
+        Closet.settle(row.part)
+    end
+
+    tool.Parent = char
+
+    for _, row in ipairs(spread) do
+        if row.part ~= handle then
+            local link = Instance.new("Weld")
+            link.Name = "closetlink"
+            link.Part0 = handle
+            link.Part1 = row.part
+            link.C0 = row.offset
+            link.Parent = handle
+        end
+    end
+
+    local grip = Instance.new("Weld")
+    grip.Name = "RightGrip"
+    grip.Part0 = hand
+    grip.Part1 = handle
+    grip.C0 = socket and socket.CFrame or CFrame.new()
+    grip.C1 = tool.Grip
+    grip.Parent = hand
+
+    Closet.worn[id] = {
+        tool = tool,
+        revert = function()
+            pcall(function() grip:Destroy() end)
+            pcall(function() tool:Destroy() end)
+        end,
+    }
+    return true, "Holding " .. Closet.shortName(id)
+end
+
+Closet.wearMeshes = function(char, id, meshes)
+    local shelf = Instance.new("Folder")
+    shelf.Name = "closet"
+    local put = {}
+    for _, mesh in ipairs(meshes) do
+        for _, old in ipairs(char:GetChildren()) do
+            if old:IsA("CharacterMesh") and old.BodyPart == mesh.BodyPart then
+                pcall(function() old.Parent = shelf end)
+            end
+        end
+        mesh.Parent = char
+        put[#put + 1] = mesh
+    end
+    Closet.worn[id] = {
+        revert = function()
+            for _, mesh in ipairs(put) do
+                pcall(function() mesh:Destroy() end)
+            end
+            for _, old in ipairs(shelf:GetChildren()) do
+                pcall(function() old.Parent = char end)
+            end
+            pcall(function() shelf:Destroy() end)
+        end,
+    }
+    return true, "Wearing " .. Closet.shortName(id)
+end
+
+Closet.wearParts = function(char, id, parts)
+    local record = {}
+    for _, part in ipairs(parts) do
+        local target = char:FindFirstChild(part.Name)
+        if target and target:IsA("MeshPart") and target ~= part then
+            local before = target:Clone()
+            local applied = pcall(function() target:ApplyMesh(part) end)
+            if applied then
+                record[#record + 1] = { part = target, before = before }
+            else
+                pcall(function() before:Destroy() end)
+            end
+        end
+    end
+    if #record == 0 then return false end
+    Closet.worn[id] = {
+        parts = record,
+        revert = function()
+            for _, row in ipairs(record) do
+                pcall(function() row.part:ApplyMesh(row.before) end)
+                pcall(function() row.before:Destroy() end)
+            end
+        end,
+    }
+    return true, "Wearing " .. Closet.shortName(id)
+end
+
+Closet.wearPack = function(char, id)
+    local pack = Avatar.fetchPack(id)
+    if not pack then return false, "Could not load asset " .. tostring(id) end
+
+    local tool = Avatar.firstOf(pack, "Tool")
+    if tool then
+        local ok, note = Closet.wearTool(char, id, tool)
+        pcall(function() pack:Destroy() end)
+        return ok, note
+    end
+
+    local meshes = Avatar.allOf(pack, "CharacterMesh")
+    if #meshes > 0 then
+        local ok, note = Closet.wearMeshes(char, id, meshes)
+        pcall(function() pack:Destroy() end)
+        return ok, note
+    end
+
+    local parts = Avatar.allOf(pack, "MeshPart")
+    if #parts > 0 then
+        local ok, note = Closet.wearParts(char, id, parts)
+        pcall(function() pack:Destroy() end)
+        if ok then return true, note end
+        return false, "That body part does not fit this rig"
+    end
+
+    pcall(function() pack:Destroy() end)
+    return false, "That asset is not something you can wear"
+end
+
+Closet.wearBundle = function(id)
+    local ids = Closet.bundleAssets(id)
+    if #ids == 0 then return false, "That bundle would not open" end
+    local put = 0
+    for _, inner in ipairs(ids) do
+        if Closet.kinds[inner] == nil then Closet.kinds[inner] = "Asset" end
+        local ok = Closet.wearId(inner)
+        if ok then put = put + 1 end
+    end
+    if put == 0 then return false, "Nothing in that bundle would go on" end
+    return true, string.format("Wearing %d of %d from %s", put, #ids, Closet.shortName(id))
+end
+
+Closet.wearId = function(id)
+    id = math.floor(tonumber(id) or 0)
+    if id <= 0 then return false, "Give me an asset id" end
+    if Closet.worn[id] then return false, "Already wearing that one" end
+
+    if Closet.hidden(id) then
+        Closet.forget(id)
+        return false, "Animations are not part of the wardrobe"
+    end
+
+    local char, humanoid = Avatar.character()
+    if not char or not humanoid or not Avatar.alive(char) then
+        return false, "No character right now"
+    end
+    if not Avatar.saved then
+        Avatar.snapshot(char, humanoid)
+    end
+
+    if Closet.kindOf(id) == "Bundle" then
+        local ok, note = Closet.wearBundle(id)
+        if ok then Closet.arm() end
+        return ok, note
+    end
+
+    local item = Avatar.fetch(id)
+    if not item then
+        local ok, note = Closet.wearPack(char, id)
+        if ok then Closet.arm() end
+        return ok, note
+    end
+    item = Avatar.modernise(item)
+
+    if item:IsA("Accoutrement") then
+        local index = Avatar.attachmentIndex(char)
+        if not Avatar.attach(char, index, item, nil) then
+            Closet.shed(item)
+            return false, "That accessory would not attach"
+        end
+        item.Parent = char
+    elseif item:IsA("Shirt") or item:IsA("Pants") or item:IsA("ShirtGraphic") then
+        local kind = item.ClassName
+        for _, old in ipairs(char:GetChildren()) do
+            if old ~= item and old.ClassName == kind then
+                for wornId, held in pairs(Closet.worn) do
+                    if held == old then Closet.worn[wornId] = nil end
+                end
+                Closet.shed(old)
+            end
+        end
+        item.Parent = char
+    elseif item:IsA("Decal") then
+        local ok, why = Closet.wearFace(char, item)
+        if not ok then
+            Closet.shed(item)
+            return false, why
+        end
+    else
+        Closet.shed(item)
+        return false, "That asset is not something you can wear"
+    end
+
+    Closet.worn[id] = item
+    Closet.arm()
+    return true, "Wearing " .. Closet.shortName(id)
+end
+
+Closet.removeId = function(id)
+    id = math.floor(tonumber(id) or 0)
+    local item = Closet.worn[id]
+    if not item then return false, "Not wearing that one" end
+    Closet.worn[id] = nil
+    Closet.shed(item)
+    Closet.changed()
+    return true, "Took off " .. Closet.shortName(id)
+end
+
+Closet.wearing = function()
+    local list = {}
+    for id in pairs(Closet.worn) do list[#list + 1] = id end
+    table.sort(list)
+    local labels = {}
+    for _, id in ipairs(list) do
+        labels[#labels + 1] = (Closet.names[id] or ("Asset " .. tostring(id))) .. "  #" .. tostring(id)
+    end
+    return labels, list
+end
+
+Closet.undress = function()
+    for id, item in pairs(Closet.worn) do
+        Closet.worn[id] = nil
+        Closet.shed(item)
+    end
+    Closet.worn = {}
+    Closet.restoreFace()
+    Closet.changed()
+end
+
+Closet.reset = function()
+    Closet.undress()
+    if Avatar.saved then
+        Avatar.restore()
+    end
+    Restore.drop("closet")
+end
+
+Closet.changed = function()
+    if Closet.onChange then pcall(Closet.onChange) end
+end
+
+Closet.arm = function()
+    Closet.changed()
+    Restore.keep("closet", function()
+        Closet.undress()
+        if Avatar.saved then
+            Avatar.restore()
+        end
+    end)
+end
+
+Closet.read = function()
+    if Closet.presets then return Closet.presets end
+    Closet.presets = {}
+    local io = Closet.io()
+    if not io then return Closet.presets end
+    local there = pcall(io.exists, Closet.file)
+    if not there then return Closet.presets end
+    local opened, body = pcall(io.read, Closet.file)
+    if not opened or type(body) ~= "string" or body == "" then return Closet.presets end
+    local read, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(body)
+    end)
+    if read and type(data) == "table" then
+        for name, ids in pairs(data) do
+            if type(name) == "string" and type(ids) == "table" then
+                local clean = {}
+                for _, id in ipairs(ids) do
+                    local held = math.floor(tonumber(id) or 0)
+                    if held > 0 then clean[#clean + 1] = held end
+                end
+                Closet.presets[name] = clean
+            end
+        end
+    end
+    return Closet.presets
+end
+
+Closet.flush = function()
+    local io = Closet.io()
+    if not io then return false, "This executor has no file api" end
+    local encoded, body = pcall(function()
+        return game:GetService("HttpService"):JSONEncode(Closet.presets or {})
+    end)
+    if not encoded then return false, "Could not encode the presets" end
+    local wrote = pcall(io.write, Closet.file, body)
+    if not wrote then return false, "Could not write the preset file" end
+    return true
+end
+
+Closet.savePreset = function(name)
+    name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return false, "Name the outfit first" end
+    local _, ids = Closet.wearing()
+    if #ids == 0 then return false, "You are not wearing anything from the catalogue" end
+    Closet.read()
+    Closet.presets[name] = ids
+    local ok, why = Closet.flush()
+    if not ok then
+        Closet.presets[name] = nil
+        return false, why
+    end
+    return true, string.format("Saved %s with %d pieces", name, #ids)
+end
+
+Closet.loadPreset = function(name)
+    Closet.read()
+    local ids = Closet.presets[name]
+    if type(ids) ~= "table" or #ids == 0 then return false, "No outfit saved under that name" end
+    Closet.undress()
+    local worn, missed = 0, 0
+    for _, id in ipairs(ids) do
+        local ok = Closet.wearId(id)
+        if ok then worn = worn + 1 else missed = missed + 1 end
+    end
+    if worn == 0 then return false, "None of that outfit would load" end
+    return true, string.format("%s on, %d worn, %d missed", name, worn, missed)
+end
+
+Closet.deletePreset = function(name)
+    Closet.read()
+    if Closet.presets[name] == nil then return false, "No outfit saved under that name" end
+    Closet.presets[name] = nil
+    local ok, why = Closet.flush()
+    if not ok then return false, why end
+    return true, "Deleted " .. tostring(name)
+end
+
+Closet.presetNames = function()
+    Closet.read()
+    local list = {}
+    for name in pairs(Closet.presets) do list[#list + 1] = name end
+    table.sort(list)
+    return list
+end
+
+local itemCatalog = { at = -math.huge, entries = {}, kinds = nil }
+
+local function readItemCatalog()
+    if os.clock() - itemCatalog.at < 5 then
+        return itemCatalog.entries, itemCatalog.kinds
+    end
+    local entries, kinds = {}, nil
+    local reached, itemModule = pcall(function() return require(ReplicatedStorage.Content.Item) end)
+    if reached and type(itemModule) == "table" and itemModule.Type then
+        kinds = itemModule.Type
+        local content = ReplicatedStorage:FindFirstChild("Content")
+        local item = content and content:FindFirstChild("Item")
+        local folder = item and item:FindFirstChild("Entities")
+        if folder then
+            local sliceStarted = os.clock()
+            for _, child in ipairs(folder:GetChildren()) do
+                if Library.Unloaded then return {}, nil end
+                if child:IsA("ModuleScript") then
+                    local ok, entry = pcall(function() return require(child) end)
+                    if ok and type(entry) == "table" then
+                        entries[#entries + 1] = { name = child.Name, entry = entry }
+                    end
+                end
+                if os.clock() - sliceStarted >= 0.003 then
+                    task.wait()
+                    sliceStarted = os.clock()
+                end
+            end
+        end
+    end
+    itemCatalog.at, itemCatalog.entries, itemCatalog.kinds = os.clock(), entries, kinds
+    return entries, kinds
+end
+
+local function loadBallSkins()
+    ballSkinList = {}
+    local ASSETS = ReplicatedStorage:FindFirstChild("Assets")
+    local BALL_FOLDER = ASSETS and ASSETS:FindFirstChild("Ball")
+    if BALL_FOLDER then
+        for _, child in ipairs(BALL_FOLDER:GetChildren()) do
+            if child:IsA("Model") then
+                table.insert(ballSkinList, child.Name)
+            end
+        end
+    end
+    table.sort(ballSkinList)
+    if #ballSkinList == 0 then
+        table.insert(ballSkinList, "ClassicBall")
+    end
+    return ballSkinList
+end
+
+loadBallSkins()
+
+local function applyJersey(id)
+    if not seen.__jerseyHook then
+        seen.__jerseyHook = track(LocalPlayer.CharacterAdded:Connect(function(character2)
+            pickedTeam = nil
+            if character2:WaitForChild("UpperTorso", 10) and autoApplyJersey then
+                task.wait(1)
+                applyJersey(selectedJersey)
+            end
+        end))
+    end
+
+    local character = LocalPlayer.Character
+    if not character or not character:FindFirstChild("UpperTorso") then
+        return false
+    end
+
+    local jerseyFolder = ReplicatedStorage:FindFirstChild("Assets")
+    jerseyFolder = jerseyFolder and jerseyFolder:FindFirstChild("Jersey")
+    if not jerseyFolder then
+        return false
+    end
+
+    local function clearWorn()
+        for _, child in ipairs(character:GetChildren()) do
+            if child.Name == "JerseyFront" or child.Name == "JerseyBack"
+                or child.Name == "_jerseyInstances"
+                or child:IsA("Clothing") or child:IsA("ShirtGraphic") then
+                child:Destroy()
+            end
+        end
+    end
+
+    if not autoApplyJersey then
+        local backup = originals[character]
+        if backup then
+            clearWorn()
+            for _, saved in ipairs(backup) do
+                local restored = saved:Clone()
+                if restored:IsA("SurfaceGui") then
+                    restored.Adornee = character:FindFirstChild("UpperTorso")
+                end
+                restored.Parent = character
+            end
+            originals[character] = nil
+        end
+        pickedTeam = nil
+        return true
+    end
+
+    if not originals[character] then
+        local backup = {}
+        for _, child in ipairs(character:GetChildren()) do
+            if child.Name == "JerseyFront" or child.Name == "JerseyBack"
+                or child:IsA("Clothing") or child:IsA("ShirtGraphic") then
+                table.insert(backup, child:Clone())
+            end
+        end
+        originals[character] = backup
+    end
+
+    local function resolveTeam()
+        local worn = character:FindFirstChildOfClass("Shirt")
+        if not worn then
+            return nil
+        end
+        for _, asset in ipairs(jerseyFolder:GetChildren()) do
+            for _, team in ipairs(asset:GetChildren()) do
+                local shirt = team:FindFirstChild("Shirt")
+                if shirt and shirt:IsA("Shirt") and shirt.ShirtTemplate == worn.ShirtTemplate then
+                    return team.Name
+                end
+            end
+        end
+        return nil
+    end
+
+    local loaded, Jersey = pcall(function() return require(ReplicatedStorage.Tools.Jersey) end)
+    if not loaded or type(Jersey) ~= "table" or not Jersey.set then
+        return false
+    end
+
+    pickedTeam = pickedTeam or resolveTeam()
+
+    local applied, err = pcall(Jersey.set, {
+        Player = LocalPlayer,
+        Character = character,
+        Id = id or selectedJersey,
+        TeamName = pickedTeam,
+    })
+    if not applied then
+        return false
+    end
+
+    pickedTeam = pickedTeam or resolveTeam()
+    return true
+end
+
+local function sweep()
+    local ballFolder = ReplicatedStorage:FindFirstChild("Assets")
+    ballFolder = ballFolder and ballFolder:FindFirstChild("Ball")
+    if not ballFolder then
+        return
+    end
+
+    local function strip(model)
+        local holder = clones[model]
+        if holder then
+            holder:Destroy()
+            clones[model] = nil
+        end
+        local saved = originals[model]
+        if saved then
+            for piece, record in pairs(saved) do
+                if piece.Parent then
+                    pcall(function()
+                        piece[record.field] = record.value
+                    end)
+                end
+            end
+            originals[model] = nil
+        end
+    end
+
+    Restore.keep("ballskin", function()
+        local held = {}
+        for model in pairs(clones) do
+            held[#held + 1] = model
+        end
+        for _, model in ipairs(held) do
+            strip(model)
+        end
+    end)
+
+    local function skin(model)
+        local driver = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+        local source = ballFolder:FindFirstChild(selectedBallSkin)
+        if not driver or not source then
+            return
+        end
+
+        strip(model)
+
+        local saved = {}
+        local function stash(piece, field, value)
+            saved[piece] = { field = field, value = piece[field] }
+            piece[field] = value
+        end
+        for _, piece in ipairs(model:GetDescendants()) do
+            if piece:IsA("BasePart") then
+                if piece.Name ~= MARK then
+                    stash(piece, "Transparency", 1)
+                end
+            elseif piece:IsA("Decal") or piece:IsA("Texture") then
+                stash(piece, "Transparency", 1)
+            elseif piece:IsA("Trail") or piece:IsA("ParticleEmitter") or piece:IsA("Beam") or piece:IsA("Light") or piece:IsA("Smoke") or piece:IsA("Fire") or piece:IsA("Sparkles") then
+                stash(piece, "Enabled", false)
+            end
+        end
+        originals[model] = saved
+
+        local holder = source:Clone()
+        holder.Name = MARK2
+        holder.Parent = model
+        local pieces = {}
+        if holder:IsA("BasePart") then
+            pieces[#pieces + 1] = holder
+        end
+        for _, candidate in ipairs(holder:GetDescendants()) do
+            if candidate:IsA("BasePart") then
+                pieces[#pieces + 1] = candidate
+            end
+        end
+
+        local anchor = holder:IsA("Model") and holder.PrimaryPart or nil
+        if not anchor then
+            local bestScore
+            for _, candidate in ipairs(pieces) do
+                if candidate:IsA("BasePart") then
+                    local vol = candidate.Size.X * candidate.Size.Y * candidate.Size.Z
+                    local roundish = math.abs(candidate.Size.X - candidate.Size.Y) < 0.5 and math.abs(candidate.Size.Y - candidate.Size.Z) < 0.5
+                    local score = vol
+                    if candidate:IsA("Part") and candidate.Shape == Enum.PartType.Ball then
+                        score = score * 6
+                    elseif roundish then
+                        score = score * 3
+                    end
+                    if not bestScore or score > bestScore then
+                        bestScore = score
+                        anchor = candidate
+                    end
+                end
+            end
+        end
+        if anchor then
+            local offset = holder:GetPivot():ToObjectSpace(anchor.CFrame)
+            holder:PivotTo(driver.CFrame * offset:Inverse())
+        else
+            holder:PivotTo(driver.CFrame)
+        end
+
+        for _, part in ipairs(pieces) do
+            part.Anchored = false
+            part.CanCollide = false
+            part.CanQuery = false
+            part.CanTouch = false
+            part.Massless = true
+            local weld = Instance.new("WeldConstraint")
+            weld.Part0 = driver
+            weld.Part1 = part
+            weld.Parent = part
+        end
+
+        clones[model] = holder
+    end
+
+    local tracked = {}
+    for model in pairs(clones) do
+        table.insert(tracked, model)
+    end
+    for _, model in ipairs(tracked) do
+        strip(model)
+    end
+
+    if not autoApplyBallSkin then
+        return
+    end
+
+    for _, model in ipairs(Workspace:GetChildren()) do
+        if model:IsA("Model") and model.Name:match("^CLIENT_BALL_") then
+            skin(model)
+        end
+    end
+
+    if not seen.__ballHook then
+        seen.__ballHook = track(Workspace.ChildAdded:Connect(function(child)
+            if not autoApplyBallSkin or not child:IsA("Model") or not child.Name:match("^CLIENT_BALL_") then
+                return
+            end
+            task.spawn(function()
+                for _ = 1, 40 do
+                    if child.PrimaryPart or child:FindFirstChildWhichIsA("BasePart") then
+                        break
+                    end
+                    task.wait(0.05)
+                end
+                if autoApplyBallSkin and child.Parent then
+                    skin(child)
+                end
+            end)
+        end))
+    end
+end
+
+local FakeAnim = {
+    source = "Kurai",
+    saved = {},
+    written = {},
+    active = {},
+    groups = {
+        Jump = { "SpikeJump", "SpikeIdle" },
+        Spike = { "Spike", "SpikeHitIdle" },
+    },
+}
+
+FakeAnim.clips = function(source)
+    local name = source or FakeAnim.source
+    local styled, style = pcall(function() return require(ReplicatedStorage.Content.Style[name]) end)
+    if not styled or type(style) ~= "table" then return nil end
+    local meta = style.Metadata
+    return type(meta) == "table" and meta.Animations or nil
+end
+
+FakeAnim.registry = function()
+    local read, anims = pcall(function() return require(ReplicatedStorage.Configuration.Animations) end)
+    if read and type(anims) == "table" then return anims end
+    return nil
+end
+
+FakeAnim.keys = function(slot)
+    local keys = {}
+    local controller = readAnimationController()
+    local styled = controller and controller.StyleAnimations
+    if styled then
+        local held, current = pcall(function() return styled:get() end)
+        if held and type(current) == "table" and current.Id then
+            keys[#keys + 1] = tostring(current.Id) .. slot
+        end
+    end
+    if #keys == 0 then
+        keys[#keys + 1] = slot
+    end
+    return keys
+end
+
+FakeAnim.evict = function(key)
+    local controller = readAnimationController()
+    if not (controller and type(controller.LoadedAnimations) == "table") then return end
+    controller.LoadedAnimations[key] = nil
+end
+
+FakeAnim.revert = function(slotKey)
+    local keys = FakeAnim.written[slotKey]
+    if not keys then return end
+    FakeAnim.written[slotKey] = nil
+    local registry = FakeAnim.registry()
+    for _, key in ipairs(keys) do
+        local original = FakeAnim.saved[key]
+        if original == nil then original = Restore.recall("fakeanim." .. key) end
+        if registry and original ~= nil then
+            registry[key] = original or nil
+        end
+        FakeAnim.saved[key] = nil
+        Restore.forget("fakeanim." .. key)
+        FakeAnim.evict(key)
+    end
+end
+
+FakeAnim.set = function(slot, on, source)
+    local slotKey = tostring(slot)
+    if not on then
+        FakeAnim.revert(slotKey)
+        Restore.drop("fakeanim." .. slotKey)
+        return true
+    end
+
+    local registry = FakeAnim.registry()
+    local clips = FakeAnim.clips(source)
+    if not registry or not clips or not clips[slot] then return false end
+
+    FakeAnim.revert(slotKey)
+    local keys = FakeAnim.keys(slot)
+    FakeAnim.written[slotKey] = keys
+    for _, key in ipairs(keys) do
+        if FakeAnim.saved[key] == nil then
+            FakeAnim.saved[key] = Restore.remember("fakeanim." .. key, registry[key] or false)
+        end
+        registry[key] = clips[slot]
+        FakeAnim.evict(key)
+    end
+    Restore.keep("fakeanim." .. slotKey, function()
+        FakeAnim.revert(slotKey)
+    end)
+    return true
+end
+
+FakeAnim.setGroup = function(group, on, source)
+    local slots = FakeAnim.groups[group]
+    if not slots then return false end
+    local name = source or FakeAnim.source
+    if not on and FakeAnim.active[group] ~= nil and FakeAnim.active[group] ~= name then
+        return false
+    end
+    local touched = false
+    for _, slot in ipairs(slots) do
+        if FakeAnim.set(slot, on, name) then touched = true end
+    end
+    FakeAnim.active[group] = on and touched and name or nil
+    return touched
+end
+
+local Vault = {
+    real = nil,
+    want = {},
+    lists = { Emote = "Emotes", ChatBubble = "ChatBubbles" },
+    kindOfList = { Emotes = "Emote", ChatBubbles = "ChatBubble" },
+    fakes = { Emotes = {}, ChatBubbles = {} },
+    base = {},
+}
+
+local PlayerCard = { installed = false, passthrough = nil }
+
+PlayerCard.controller = function()
+    local reached, Knit = pcall(function() return require(ReplicatedStorage.Packages.Knit) end)
+    if not reached then return nil end
+    local found, controller = pcall(Knit.GetController, "PlayerCardController")
+    if not found or type(controller) ~= "table" then return nil end
+    return controller
+end
+
+PlayerCard.install = function()
+    if PlayerCard.installed then return true end
+    local controller = PlayerCard.controller()
+    if not controller or type(controller.DisplayFlashCard) ~= "function" then return false end
+
+    local passthrough = Restore.recall("playercard.flash")
+    if passthrough == nil then
+        passthrough = controller.DisplayFlashCard
+        Restore.remember("playercard.flash", passthrough)
+    end
+    PlayerCard.passthrough = passthrough
+    PlayerCard.wrapper = function(self, payload, ...)
+        if playerCardEnabled and selectedCard and type(payload) == "table" and payload.Player == LocalPlayer then
+            payload = table.clone(payload)
+            payload.PlayerCardItemId = selectedCard
+        end
+        return passthrough(self, payload, ...)
+    end
+    controller.DisplayFlashCard = PlayerCard.wrapper
+    PlayerCard.installed = true
+    Restore.keep("playercard", function()
+        playerCardEnabled = false
+        PlayerCard.uninstall()
+    end)
+    return true
+end
+
+PlayerCard.uninstall = function()
+    if not PlayerCard.installed then return end
+    local controller = PlayerCard.controller()
+    if controller and controller.DisplayFlashCard == PlayerCard.wrapper and PlayerCard.passthrough then
+        controller.DisplayFlashCard = PlayerCard.passthrough
+    end
+    PlayerCard.wrapper = nil
+    Restore.forget("playercard.flash")
+    PlayerCard.passthrough = nil
+    PlayerCard.installed = false
+end
+
+PlayerCard.preview = function(id)
+    local controller = PlayerCard.controller()
+    if not controller then return false end
+    return (pcall(controller.DisplayFlashCard, controller, {
+        Player = LocalPlayer,
+        PlayerCardItemId = id or selectedCard,
+        Context = { PlacementId = "ScoredPoint" },
+    }))
+end
+
+local function fireCardRemote()
+    PlayerCard.install()
+end
+
+local function enablePlayerCard()
+    playerCardEnabled = true
+    PlayerCard.install()
+    Vault.mark("PlayerCard", true)
+    if selectedCard then
+        Vault.dress(selectedCard)
+        task.spawn(PlayerCard.preview, selectedCard)
+    end
+end
+
+local function disablePlayerCard()
+    playerCardEnabled = false
+    local picked = selectedCard
+    if Vault.realEquipped then
+        Vault.revert("PlayerCard")
+    end
+    selectedCard = picked
+    Vault.mark("PlayerCard", false)
+    PlayerCard.uninstall()
+end
+
+local Cosmetics = {
+    localKinds = { Ball = true, Title = true, ScoreEffect = true, WinScreen = true, ProfileArt = true },
+    picked = { WinScreen = "ClassicWinScreen", ProfileArt = "ClassicProfileArt" },
+    enabled = {},
+    touched = {},
+    autoSave = true,
+    autoRestore = true,
+    applied = {},
+    file = "Tomboy/visuals.json",
+    loaded = false,
+}
+
+Cosmetics.asGame = function(callback, ...)
+    local identity
+    if type(getthreadidentity) == "function" and type(setthreadidentity) == "function" then
+        local read, current = pcall(getthreadidentity)
+        if read and type(current) == "number" then
+            if not pcall(setthreadidentity, 2) then return false end
+            identity = current
+        end
+    end
+    local ok, result = pcall(callback, ...)
+    if identity then pcall(setthreadidentity, identity) end
+    return ok, result
+end
+
+Cosmetics.io = function()
+    local write = rawget(_G, "writefile") or writefile
+    local read = rawget(_G, "readfile") or readfile
+    local exists = rawget(_G, "isfile") or isfile
+    if type(write) ~= "function" or type(read) ~= "function" then return nil end
+    return { write = write, read = read, exists = exists }
+end
+
+Cosmetics.persist = function()
+    local io = Cosmetics.io()
+    if not io then return end
+    local http = Cosmetics.http
+    if not http then
+        http = game:GetService("HttpService")
+        Cosmetics.http = http
+    end
+    local ok, encoded = pcall(http.JSONEncode, http, Cosmetics.applied)
+    if ok then
+        pcall(io.write, Cosmetics.file, encoded)
+    end
+end
+
+Cosmetics.flush = function()
+    if Cosmetics.pending then return end
+    Cosmetics.pending = true
+    task.delay(0.75, function()
+        Cosmetics.pending = false
+        if Cosmetics.autoRestore and not Cosmetics.loaded then return end
+        Cosmetics.persist()
+    end)
+end
+
+Cosmetics.record = function(kind, id)
+    if not kind then return end
+    Cosmetics.applied[kind] = id or nil
+    if Cosmetics.autoSave then
+        Cosmetics.flush()
+    end
+end
+
+Cosmetics.read = function()
+    local io = Cosmetics.io()
+    if not io then return nil end
+    if io.exists and not io.exists(Cosmetics.file) then return nil end
+    local ok, raw = pcall(io.read, Cosmetics.file)
+    if not ok or type(raw) ~= "string" then return nil end
+    local http = game:GetService("HttpService")
+    local parsed, data = pcall(http.JSONDecode, http, raw)
+    if parsed and type(data) == "table" then return data end
+    return nil
+end
+
+Cosmetics.restore = function()
+    if Cosmetics.loaded or not Cosmetics.autoRestore then return end
+    Cosmetics.loaded = true
+    local data = Cosmetics.read()
+    if not data then
+        if Cosmetics.autoSave and next(Cosmetics.applied) then Cosmetics.flush() end
+        return
+    end
+    task.spawn(function()
+        for kind, id in pairs(data) do
+            if type(id) == "string" then
+                if Cosmetics.localKinds[kind] then
+                    if not Cosmetics.touched[kind] then pcall(Cosmetics.restoreLocal, kind, id) end
+                elseif Vault.typeOf(id) == kind then
+                    if kind == "PlayerCard" then Vault.mark(kind, true) end
+                    pcall(Vault.dress, id)
+                end
+            elseif type(id) == "table" and Vault.kindOfList[kind] then
+                pcall(Vault.restoreList, kind, id)
+            end
+        end
+        if Cosmetics.autoSave then Cosmetics.flush() end
+    end)
+end
+
+Vault.index = function(folder)
+    if Vault.catalogue and Vault.catalogueRoot == folder then return Vault.catalogue end
+    local listed = { byName = {}, byId = {} }
+    for _, child in ipairs(folder:GetChildren()) do
+        if child:IsA("ModuleScript") then
+            local read, entry = pcall(function() return require(child) end)
+            if read and type(entry) == "table" and entry.Type then
+                listed.byName[child.Name] = entry
+                if entry.Id ~= nil then
+                    local key = tostring(entry.Id)
+                    if listed.byId[key] == nil then
+                        listed.byId[key] = { name = child.Name, entry = entry }
+                    end
+                end
+            end
+        end
+    end
+    Vault.catalogue = listed
+    Vault.catalogueRoot = folder
+    return listed
+end
+
+Vault.mark = function(kind, on)
+    if Cosmetics.localKinds[kind] then return Cosmetics.setLocal(kind, on) end
+    if on and not Vault.wear() then
+        Vault.want[kind] = nil
+        return false
+    end
+    Vault.want[kind] = on or nil
+
+    local reached, Knit = pcall(function() return require(ReplicatedStorage.Packages.Knit) end)
+    if not reached then return end
+    local found, inventory = pcall(Knit.GetController, "InventoryController")
+    if not found or type(inventory) ~= "table" or not inventory.Inventory then return end
+
+    local held, current = pcall(function()
+        return inventory.Inventory:get()
+    end)
+    if not held or type(current) ~= "table" then return end
+    if Vault.real == nil and next(current) == nil then
+        Vault.want[kind] = nil
+        return false
+    end
+
+    local genv = (type(getgenv) == "function" and getgenv()) or _G
+    local session = type(genv.TOMBOY_COSMETIC_SESSION) == "table" and genv.TOMBOY_COSMETIC_SESSION or nil
+
+    if not Vault.real then
+        local carried = session and session.vault or nil
+        if carried and carried.inventory then
+            Vault.real = carried.inventory
+            Vault.realTitle = carried.title
+            Vault.realEquipped = carried.equipped or {}
+        else
+            local snapshot = {}
+            for id, count in pairs(current) do
+                snapshot[id] = count
+            end
+            Vault.real = snapshot
+            Vault.realTitle = LocalPlayer:GetAttribute("User_Title")
+            local heldWorn, worn = pcall(function()
+                return inventory.Equipped:get()
+            end)
+            local realEquipped = {}
+            if heldWorn and type(worn) == "table" then
+                for slot, value in pairs(worn) do
+                    realEquipped[slot] = value
+                end
+            end
+            Vault.realEquipped = realEquipped
+            if session then
+                session.vault = {
+                    inventory = Vault.real,
+                    title = Vault.realTitle,
+                    equipped = Vault.realEquipped,
+                }
+            end
+        end
+    end
+
+    local wanted = false
+    for _ in pairs(Vault.want) do
+        wanted = true
+        break
+    end
+    if not wanted then
+        pcall(function()
+            inventory.Inventory:set(Vault.real)
+        end)
+        Vault.real = nil
+        if session then
+            session.vault = nil
+        end
+        return
+    end
+
+    local catalogued, Item = pcall(function() return require(ReplicatedStorage.Content.Item) end)
+    local entities = ReplicatedStorage.Content.Item:FindFirstChild("Entities")
+    if not catalogued or not entities then return end
+
+    local stocked = {}
+    for id, count in pairs(Vault.real) do
+        stocked[id] = count
+    end
+    for name, entry in pairs(Vault.index(entities).byName) do
+        if not stocked[name] then
+            for kindName in pairs(Vault.want) do
+                if entry.Type == Item.Type[kindName] then
+                    stocked[name] = 1
+                    break
+                end
+            end
+        end
+    end
+    local settled = true
+    for id, count in pairs(stocked) do
+        if current[id] ~= count then
+            settled = false
+            break
+        end
+    end
+    if settled then
+        for id in pairs(current) do
+            if stocked[id] == nil then
+                settled = false
+                break
+            end
+        end
+    end
+    if settled then return end
+    pcall(function()
+        inventory.Inventory:set(stocked)
+    end)
+end
+
+Vault.typeOf = function(id)
+    local key = tostring(id)
+    local content = ReplicatedStorage:FindFirstChild("Content")
+    local item = content and content:FindFirstChild("Item")
+    local folder = item and item:FindFirstChild("Entities")
+    if not folder then return nil end
+    local module = folder:FindFirstChild(key)
+    if module then
+        local read, entry = pcall(function() return require(module) end)
+        if read and type(entry) == "table" and entry.Type then
+            return entry.Type, entry, module.Name
+        end
+        return nil
+    end
+    local found = Vault.index(folder).byId[key]
+    if found then
+        return found.entry.Type, found.entry, found.name
+    end
+    return nil
+end
+
+Vault.paint = function(kind, id, entry)
+    local real = Vault.realEquipped or {}
+    if kind == "Title" then
+        pcall(function()
+            local text = id and ((entry and entry.DisplayName) or id) or Vault.realTitle
+            LocalPlayer:SetAttribute("User_Title", text)
+        end)
+    elseif kind == "ScoreEffect" then
+        selectedEffect = id or real.ScoreEffect or "SupernovaScoreEffect"
+    elseif kind == "Ball" then
+        selectedBallSkin = id or real.Ball or "ClassicBall"
+        task.spawn(function()
+            pcall(sweep)
+        end)
+    elseif kind == "Jersey" then
+        selectedJersey = id or real.Jersey or "DragonTuxedoJersey"
+        pickedTeam = nil
+        task.spawn(function()
+            pcall(applyJersey, selectedJersey)
+        end)
+    elseif kind == "PlayerCard" then
+        selectedCard = id or real.PlayerCard or "UltimateChampionPlayerCard"
+        task.spawn(function()
+            pcall(fireCardRemote)
+        end)
+    end
+end
+
+Vault.setSlot = function(kind, id)
+    local reached, Knit = pcall(function() return require(ReplicatedStorage.Packages.Knit) end)
+    if not reached then return end
+    local found, inventory = pcall(Knit.GetController, "InventoryController")
+    if not found or type(inventory) ~= "table" or not inventory.Equipped then return end
+    local held, worn = pcall(function()
+        return inventory.Equipped:get()
+    end)
+    if not held or type(worn) ~= "table" then return end
+    local dressed = {}
+    for slot, value in pairs(worn) do
+        dressed[slot] = value
+    end
+    dressed[kind] = id
+    pcall(function()
+        inventory.Equipped:set(dressed)
+    end)
+end
+
+Vault.currentSlot = function(kind)
+    local reached, Knit = pcall(function() return require(ReplicatedStorage.Packages.Knit) end)
+    if not reached then return nil end
+    local found, inventory = pcall(Knit.GetController, "InventoryController")
+    if not found or type(inventory) ~= "table" or not inventory.Equipped then return nil end
+    local held, worn = pcall(function()
+        return inventory.Equipped:get()
+    end)
+    if held and type(worn) == "table" then
+        return worn[kind]
+    end
+    return nil
+end
+
+Vault.dress = function(id)
+    local kind, entry = Vault.typeOf(id)
+    if Cosmetics.localKinds[kind] then return Cosmetics.select(kind, id) end
+    if not kind then return false end
+    if kind == "Title" or kind == "ScoreEffect" or kind == "Ball" or kind == "Jersey" or kind == "PlayerCard" then
+        Vault.paint(kind, id, entry)
+    elseif kind ~= "ProfileArt" then
+        return false
+    end
+    Vault.setSlot(kind, id)
+    Cosmetics.record(kind, id)
+    return true
+end
+
+Vault.revert = function(kind)
+    if Cosmetics.localKinds[kind] then return Cosmetics.setLocal(kind, false) end
+    local realId = Vault.realEquipped and Vault.realEquipped[kind] or nil
+    Vault.paint(kind, nil)
+    Vault.setSlot(kind, realId)
+    Cosmetics.record(kind, nil)
+end
+
+Vault.wear = function()
+    if Vault.worn then return true end
+    local located, remote = pcall(function()
+        return ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"].knit.Services.InventoryService.RF.Equip
+    end)
+    if not located or not remote then return false end
+
+    Vault.worn = Bridge.on(remote, "InvokeServer", "vault", 10, function()
+        return Vault.real ~= nil
+    end, function(args)
+        local id = args[1]
+        if type(id) ~= "string" or not Vault.real then return false end
+        local kind, entry = Vault.typeOf(id)
+        if Cosmetics.localKinds[kind] or not Vault.want[kind] then return false end
+        if Vault.lists[kind] then
+            local index = tonumber(args[2])
+            if not index then return false end
+            if Vault.real[id] then
+                if Vault.fakes[Vault.lists[kind]][index] then Vault.place(kind, index, nil) end
+                return false
+            end
+            if Vault.place(kind, index, id) then return true, table.pack(nil) end
+            return true, table.pack("Could not equip")
+        end
+        if not Vault.real[id] then
+            if kind and Vault.currentSlot(kind) == id then
+                Vault.revert(kind)
+                return true, table.pack(true)
+            end
+            return true, table.pack(Vault.dress(id))
+        elseif kind then
+            Vault.paint(kind, id, entry)
+        end
+        return false
+    end)
+    local found, use = pcall(function()
+        return ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"].knit.Services.InventoryService.RF.Use
+    end)
+    if Vault.worn and found and use then
+        Bridge.on(use, "InvokeServer", "vaultuse", 10, function()
+            return Vault.real ~= nil
+        end, function(args)
+            local id = args[1]
+            if type(id) ~= "string" or not Vault.real or Vault.real[id] then return false end
+            local kind = Vault.typeOf(id)
+            if not Vault.lists[kind] or not Vault.want[kind] then return false end
+            if kind == "ChatBubble" then task.spawn(Vault.bubble, id) end
+            return true, table.pack(nil)
+        end)
+    end
+    return Vault.worn
+end
+
+Vault.sources = function()
+    local reached, Knit = pcall(function() return require(ReplicatedStorage.Packages.Knit) end)
+    if not reached then return {}, nil end
+    local found = {}
+    local ok, inventory = pcall(Knit.GetController, "InventoryController")
+    if ok and type(inventory) == "table" and inventory.Equipped then found[#found + 1] = inventory.Equipped end
+    local held, persisted = pcall(function()
+        return require(game:GetService("ReplicatedFirst").Components.Persistence).Data.Equipped
+    end)
+    if held and persisted then found[#found + 1] = persisted end
+    local got, emotes = pcall(Knit.GetController, "EmoteController")
+    return found, (got and type(emotes) == "table") and emotes.Emotes or nil
+end
+
+Vault.slotted = function(list)
+    local base = Vault.base[list]
+    if type(base) ~= "table" then return nil end
+    local slots = table.clone(base)
+    for index, id in pairs(Vault.fakes[list]) do slots[index] = id end
+    return slots
+end
+
+Vault.lay = function()
+    local equipped, emotes = Vault.sources()
+    for _, value in ipairs(equipped) do
+        pcall(function()
+            local worn = value:get()
+            if type(worn) ~= "table" then return end
+            local dressed = table.clone(worn)
+            for list in pairs(Vault.fakes) do
+                local slots = Vault.slotted(list)
+                if slots then dressed[list] = slots end
+            end
+            value:set(dressed)
+        end)
+    end
+    local emoteSlots = Vault.slotted("Emotes")
+    if emotes and emoteSlots then
+        pcall(function() emotes:set(emoteSlots) end)
+    end
+end
+
+Vault.faking = function()
+    for _, fakes in pairs(Vault.fakes) do
+        if next(fakes) then return true end
+    end
+    return false
+end
+
+Vault.listen = function()
+    if Vault.heard then return true end
+    local found, remote = pcall(function()
+        return ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"].knit.Services.DataService.RE.ProfileUpdated
+    end)
+    if not found or not remote then return false end
+    Vault.heard = track(remote.OnClientEvent:Connect(function(key, value)
+        if key ~= "Equipped" or type(value) ~= "table" then return end
+        for _, list in pairs(Vault.lists) do
+            if type(value[list]) == "table" then Vault.base[list] = table.clone(value[list]) end
+        end
+        if Vault.faking() then task.defer(Vault.lay) end
+    end))
+    return true
+end
+
+Vault.keepSlots = function(list)
+    local saved = {}
+    for index, id in pairs(Vault.fakes[list]) do saved[tostring(index)] = id end
+    Cosmetics.record(list, next(saved) and saved or nil)
+end
+
+Vault.place = function(kind, index, id)
+    local list = Vault.lists[kind]
+    if not list or type(index) ~= "number" then return false end
+    if not Vault.base[list] then
+        local worn = Vault.currentSlot(list)
+        if type(worn) ~= "table" or worn[index] == nil then return false end
+        Vault.base[list] = table.clone(worn)
+    end
+    if Vault.base[list][index] == nil then return false end
+    Vault.listen()
+    Vault.fakes[list][index] = id
+    Vault.lay()
+    Vault.keepSlots(list)
+    return true
+end
+
+Vault.bubble = function(id)
+    local reached, bubble = pcall(function()
+        return require(game:GetService("ReplicatedFirst").Components.ChatBubble)
+    end)
+    if not reached or type(bubble) ~= "table" or type(bubble.new) ~= "function" then return end
+    Cosmetics.asGame(bubble.new, { Player = LocalPlayer, ItemId = id })
+end
+
+Vault.unlockList = function(kind, on)
+    local list = Vault.lists[kind]
+    if not list then return false end
+    if on then
+        Vault.mark(kind, true)
+        return Vault.want[kind] == true
+    end
+    if next(Vault.fakes[list]) then
+        Vault.fakes[list] = {}
+        Vault.lay()
+    end
+    Cosmetics.record(list, nil)
+    if Vault.want[kind] then Vault.mark(kind, false) end
+    return true
+end
+
+Vault.restoreList = function(list, saved)
+    local kind = Vault.kindOfList[list]
+    if not kind or Vault.want[kind] then return false end
+    if not Vault.unlockList(kind, true) then return false end
+    local placed = false
+    for key, id in pairs(saved) do
+        local index = tonumber(key)
+        if index and type(id) == "string" and Vault.typeOf(id) == kind and not Vault.real[id] then
+            placed = Vault.place(kind, index, id) or placed
+        end
+    end
+    local toggle = Toggles and Toggles[kind == "Emote" and "unlockemotes" or "unlockbubbles"]
+    if toggle then toggle:SetValue(true, true) end
+    return placed
+end
+
+Restore.keep("vaultlists", function()
+    for kind, list in pairs(Vault.lists) do
+        if next(Vault.fakes[list]) then
+            Vault.fakes[list] = {}
+            Vault.lay()
+        end
+        if Vault.want[kind] then pcall(Vault.mark, kind, false) end
+    end
+end)
+
+local ScoreVisual = { connection = nil, last = nil, serial = 0 }
+
+ScoreVisual.render = function(id, position, character)
+    if id == "GroundHit1" or id == "GroundHit2" then
+        local folder = ReplicatedStorage.Assets:FindFirstChild("Effects")
+        local module = folder and folder:FindFirstChild(id)
+        if not module then return false end
+        require(module)(CFrame.new(position))
+        return true
+    end
+    local Item = require(ReplicatedStorage.Content.Item)
+    local item = Item:Get(id)
+    if not item or item.Type ~= Item.Type.ScoreEffect then return false end
+    local Knit = require(ReplicatedStorage.Packages.Knit)
+    local controller = Knit.GetController("EffectController")
+    if type(controller) ~= "table" or type(controller.PlayScoreEffect) ~= "function" then return false end
+    local sound = item.Metadata and item.Metadata.Sound
+    if sound then
+        local Sound = require(ReplicatedStorage.Tools.Sound)
+        if not Sound.isRegistered(id) then
+            local config = table.clone(sound)
+            config.Volume = 4
+            config.PlaybackSpeed = NumberRange.new(0.9, 1.1)
+            Sound.register(id, config)
+        end
+        Sound.fromName(id)({ Origin = CFrame.new(position) })
+    end
+    controller:PlayScoreEffect({
+        IsPreview = false, PlayTime = 5, Item = item,
+        Origin = position, Character = character,
+    })
+    return true
+end
+
+local function disableHitEffect()
+    ScoreVisual.serial = ScoreVisual.serial + 1
+    if ScoreVisual.connection then ScoreVisual.connection:Disconnect() end
+    ScoreVisual.connection, ScoreVisual.last = nil, nil
+end
+
+local function enableHitEffect()
+    if ScoreVisual.connection then return true end
+    local remote = Remote.get("BallService", "RE", "HitGround")
+    if not remote then return false end
+    ScoreVisual.serial = ScoreVisual.serial + 1
+    local serial = ScoreVisual.serial
+    ScoreVisual.connection = track(remote.OnClientEvent:Connect(function(position, hardHit, isOut, _, effectId, character)
+        if not hitEffectEnabled or ScoreVisual.serial ~= serial then return end
+        if typeof(position) ~= "Vector3" or isOut ~= false
+            or not LocalPlayer.Character or character ~= LocalPlayer.Character then return end
+        local selected = selectedEffect
+        -- The game's own listener already renders this exact effect.
+        if selected == effectId or (not effectId and selected == (hardHit and "GroundHit2" or "GroundHit1")) then return end
+        local now, last = os.clock(), ScoreVisual.last
+        if last and last.id == selected and last.character == character
+            and last.position == position and now - last.at < 0.05 then return end
+        ScoreVisual.last = { id = selected, character = character, position = position, at = now }
+        local ok, rendered = pcall(ScoreVisual.render, selected, position, character)
+        if not ok or not rendered then ScoreVisual.last = nil end
+    end))
+    return true
+end
+
+Cosmetics.selection = function(kind)
+    if kind == "Ball" then return selectedBallSkin end
+    if kind == "Title" then return selectedTitle end
+    if kind == "ScoreEffect" then return selectedEffect end
+    return Cosmetics.picked[kind]
+end
+
+Cosmetics.valid = function(kind, id)
+    if type(id) ~= "string" or id == "None Found" then return false end
+    if kind == "Ball" then
+        local assets = ReplicatedStorage:FindFirstChild("Assets")
+        local folder = assets and assets:FindFirstChild("Ball")
+        return folder ~= nil and folder:FindFirstChild(id) ~= nil
+    end
+    if kind == "ScoreEffect" and (id == "GroundHit1" or id == "GroundHit2") then return true end
+    return Vault.typeOf(id) == kind
+end
+
+Cosmetics.paintTitle = function()
+    if not Cosmetics.enabled.Title then return end
+    local kind, entry = Vault.typeOf(selectedTitle)
+    if kind ~= "Title" then return end
+    Cosmetics.titlePainted = (entry and entry.DisplayName) or selectedTitle
+    Cosmetics.titleWriting = true
+    LocalPlayer:SetAttribute("User_Title", Cosmetics.titlePainted)
+    Cosmetics.titleWriting = false
+end
+
+Cosmetics.setLocal = function(kind, on, remember)
+    if not Cosmetics.localKinds[kind] then return false end
+    local id = Cosmetics.selection(kind)
+    if on and not Cosmetics.valid(kind, id) then return false end
+    if remember ~= false then Cosmetics.touched[kind] = true end
+    local wasEnabled = Cosmetics.enabled[kind]
+    Cosmetics.enabled[kind] = on or nil
+    if kind == "Ball" then
+        autoApplyBallSkin = on
+        sweep()
+    elseif kind == "Title" then
+        if on then
+            if not wasEnabled then
+                Cosmetics.titleOriginal = LocalPlayer:GetAttribute("User_Title")
+                Cosmetics.titleLink = track(LocalPlayer:GetAttributeChangedSignal("User_Title"):Connect(function()
+                    if Cosmetics.titleWriting or not Cosmetics.enabled.Title then return end
+                    local value = LocalPlayer:GetAttribute("User_Title")
+                    if value == Cosmetics.titlePainted then return end
+                    Cosmetics.titleOriginal = value
+                    Cosmetics.paintTitle()
+                end))
+            end
+            Cosmetics.paintTitle()
+        else
+            if Cosmetics.titleLink then Cosmetics.titleLink:Disconnect(); Cosmetics.titleLink = nil end
+            if wasEnabled and LocalPlayer:GetAttribute("User_Title") == Cosmetics.titlePainted then
+                LocalPlayer:SetAttribute("User_Title", Cosmetics.titleOriginal)
+            end
+            Cosmetics.titleOriginal, Cosmetics.titlePainted = nil, nil
+        end
+    elseif kind == "ScoreEffect" then
+        hitEffectEnabled = on
+        if on then
+            if not enableHitEffect() then
+                hitEffectEnabled, Cosmetics.enabled[kind] = false, nil
+                return false
+            end
+        else
+            disableHitEffect()
+        end
+    elseif kind == "WinScreen" then
+        if on then
+            if not Cosmetics.winHook() then
+                Cosmetics.enabled[kind] = nil
+                return false
+            end
+        else
+            Restore.drop("wincutscene")
+        end
+    elseif kind == "ProfileArt" then
+        if on then
+            if not Cosmetics.artHook() then
+                Cosmetics.enabled[kind] = nil
+                return false
+            end
+        end
+        Cosmetics.artPaint()
+        if not on then Restore.drop("profileart") end
+    end
+    if remember ~= false then Cosmetics.record(kind, on and id or nil) end
+    return true
+end
+
+Cosmetics.select = function(kind, id)
+    if not Cosmetics.valid(kind, id) then return false end
+    if kind == "Ball" then selectedBallSkin = id
+    elseif kind == "Title" then selectedTitle = id
+    elseif kind == "ScoreEffect" then selectedEffect = id
+    elseif Cosmetics.picked[kind] ~= nil then Cosmetics.picked[kind] = id
+    else return false end
+    if Cosmetics.enabled[kind] then return Cosmetics.setLocal(kind, true) end
+    return true
+end
+
+Cosmetics.restoreLocal = function(kind, id)
+    if not Cosmetics.select(kind, id) then return false end
+    if not Cosmetics.setLocal(kind, true, false) then return false end
+    local controls = {
+        Ball = { "ballselect", "autoapplyball" }, Title = { "titleselect", "titleunlock" },
+        ScoreEffect = { "effectselect", "scoreeffect" }, WinScreen = { "winscreenselect", "winscreenon" },
+        ProfileArt = { "profileartselect", "profilearton" },
+    }
+    local names = controls[kind]
+    local option = Options and Options[names[1]]
+    local toggle = Toggles and Toggles[names[2]]
+    if option then option:SetValue(id, true) end
+    if toggle then toggle:SetValue(true, true) end
+    Cosmetics.applied[kind] = id
+    return true
+end
+
+Restore.keep("localcosmetics", function()
+    for kind in pairs(Cosmetics.localKinds) do Cosmetics.setLocal(kind, false, false) end
+end)
+
+Cosmetics.listOf = function(kind)
+    local found = {}
+    local entries, kinds = readItemCatalog()
+    if kinds and kinds[kind] ~= nil then
+        for _, item in ipairs(entries) do
+            if item.entry.Type == kinds[kind] then found[#found + 1] = tostring(item.entry.Id or item.name) end
+        end
+    end
+    table.sort(found)
+    return found
+end
+
+Cosmetics.winModule = function()
+    local ok, module = pcall(function()
+        return require(game:GetService("ReplicatedFirst").Controllers.GameController.Components.Screens.WinCutscene)
+    end)
+    if ok and type(module) == "table" and type(module.play) == "function" then return module end
+    return nil
+end
+
+Cosmetics.winHook = function()
+    if Cosmetics.winWrapper then return true end
+    local module = Cosmetics.winModule()
+    if not module then return false end
+    local passthrough = Restore.recall("wincutscene.play")
+    if passthrough == nil then
+        passthrough = module.play
+        Restore.remember("wincutscene.play", passthrough)
+    end
+    Cosmetics.winWrapper = function(payload, ...)
+        local id = Cosmetics.picked.WinScreen
+        if Cosmetics.enabled.WinScreen and type(payload) == "table" and type(payload.Cutscene) == "table"
+            and table.find(payload.Cutscene, LocalPlayer) and Vault.typeOf(id) == "WinScreen" then
+            payload = table.clone(payload)
+            payload.CutsceneId = id
+        end
+        return passthrough(payload, ...)
+    end
+    module.play = Cosmetics.winWrapper
+    Restore.keep("wincutscene", function()
+        local held = Cosmetics.winModule()
+        if held and held.play == Cosmetics.winWrapper then held.play = passthrough end
+        Restore.forget("wincutscene.play")
+        Cosmetics.winWrapper = nil
+    end)
+    return true
+end
+
+Cosmetics.winSweep = function(prefix)
+    for _, child in ipairs(Workspace:GetChildren()) do
+        if child:IsA("Model") and string.sub(child.Name, 1, #prefix) == prefix then child:Destroy() end
+    end
+end
+
+Cosmetics.winPreview = function(id)
+    local kind, entry = Vault.typeOf(id)
+    if kind ~= "WinScreen" or type(entry) ~= "table" or typeof(entry.Asset) ~= "Instance" then
+        return false, "Pick a win screen first"
+    end
+    if Cosmetics.winScene then return false, "A win screen is already playing" end
+    local reached, Knit = pcall(function() return require(ReplicatedStorage.Packages.Knit) end)
+    local found, interface = false, nil
+    if reached then found, interface = pcall(Knit.GetController, "InterfaceController") end
+    if found and type(interface) == "table" and interface.InGame then
+        local read, inGame = pcall(function() return interface.InGame:get() end)
+        if read and inGame then return false, "Preview only works in the lobby" end
+    end
+    local loaded, Cutscene = pcall(function()
+        return require(game:GetService("ReplicatedFirst").Components.Cutscene)
+    end)
+    if not loaded or type(Cutscene) ~= "table" or type(Cutscene.new) ~= "function" then
+        return false, "Win screens are unavailable"
+    end
+    local prefix = entry.Asset.Name .. " Cutscene @"
+    Cosmetics.winScene = true
+    Restore.keep("winpreview", function()
+        local scene = Cosmetics.winScene
+        Cosmetics.winScene = nil
+        if type(scene) == "table" then pcall(scene.Destroy, scene) end
+        pcall(Cosmetics.winSweep, prefix)
+    end)
+    local started = Cosmetics.asGame(function()
+        task.spawn(function()
+            local made, scene = pcall(Cutscene.new, {
+                ShowJerseys = true,
+                Cutscene = entry.Asset,
+                Players = { LocalPlayer },
+            })
+            if not made then
+                Cosmetics.winScene = nil
+                pcall(Cosmetics.winSweep, prefix)
+                return
+            end
+            Cosmetics.winScene = scene
+            task.wait(((entry.Metadata and entry.Metadata.Length) or 7) + 0.5)
+            if Cosmetics.winScene == scene then
+                Cosmetics.winScene = nil
+                pcall(scene.Destroy, scene)
+            end
+        end)
+    end)
+    if not started then
+        Cosmetics.winScene = nil
+        return false, "Win screens are unavailable"
+    end
+    return true
+end
+
+Cosmetics.artStates = function()
+    local ok, module = pcall(function()
+        return require(game:GetService("ReplicatedFirst").Controllers.PlayerInspectController.StatesHandler)
+    end)
+    if ok and type(module) == "table" and type(module.setStatesFromInspectResults) == "function" then return module end
+    return nil
+end
+
+Cosmetics.artHook = function()
+    if Cosmetics.artWrapper then return true end
+    local module = Cosmetics.artStates()
+    if not module then return false end
+    local passthrough = Restore.recall("inspect.states")
+    if passthrough == nil then
+        passthrough = module.setStatesFromInspectResults
+        Restore.remember("inspect.states", passthrough)
+    end
+    Cosmetics.artWrapper = function(results, ...)
+        if type(results) == "table" and results.UserId == LocalPlayer.UserId then
+            Cosmetics.artReal = results.Art
+            if Cosmetics.enabled.ProfileArt and Vault.typeOf(Cosmetics.picked.ProfileArt) == "ProfileArt" then
+                results = table.clone(results)
+                results.Art = Cosmetics.picked.ProfileArt
+            end
+        end
+        return passthrough(results, ...)
+    end
+    module.setStatesFromInspectResults = Cosmetics.artWrapper
+    Restore.keep("profileart", function()
+        local held = Cosmetics.artStates()
+        if held and held.setStatesFromInspectResults == Cosmetics.artWrapper then
+            held.setStatesFromInspectResults = passthrough
+        end
+        Restore.forget("inspect.states")
+        Cosmetics.artWrapper = nil
+    end)
+    return true
+end
+
+Cosmetics.artPaint = function()
+    local module = Cosmetics.artStates()
+    local states = module and module.MenuStates
+    if type(states) ~= "table" then return end
+    local read, shown = pcall(function() return states.Player.UserId:get() end)
+    if not read or shown ~= LocalPlayer.UserId then return end
+    local art = Cosmetics.artReal or Vault.currentSlot("ProfileArt")
+    if Cosmetics.enabled.ProfileArt and Vault.typeOf(Cosmetics.picked.ProfileArt) == "ProfileArt" then
+        art = Cosmetics.picked.ProfileArt
+    end
+    if art == nil then return end
+    Cosmetics.asGame(function() states.Profile.Art:set(art) end)
+end
+
+local VisualAvatar = {
+    enabled = false,
+    username = "",
+    generation = 0,
+    typed = 0,
+    settle = 0.6,
+    reach = 12,
+    reindex = 0.25,
+    healGap = 3,
+    healAt = -math.huge,
+    hidden = {},
+    links = {},
+    renderName = MARK .. "_VisualAvatar",
+    copyName = MARK .. "_VisualCopies",
+    copies = setmetatable({}, { __mode = "k" }),
+    hooks = {},
+    styled = { ForceField = true, Neon = true, Glass = true },
+    accessoryTypes = {
+        [8] = "Hat", [41] = "Hair", [42] = "Face", [43] = "Neck", [44] = "Shoulder", [45] = "Front",
+        [46] = "Back", [47] = "Waist", [64] = "TShirt", [65] = "Shirt", [66] = "Pants", [67] = "Jacket",
+        [68] = "Sweater", [69] = "Shorts", [70] = "LeftShoe", [71] = "RightShoe", [72] = "DressSkirt",
+        [76] = "Eyebrow", [77] = "Eyelash",
+    },
+}
+
+VisualAvatar.firstPerson = function()
+    local ok, near = pcall(function()
+        local camera = Workspace.CurrentCamera
+        return (camera.CFrame.Position - camera.Focus.Position).Magnitude < 1
+    end)
+    return ok and near == true
+end
+
+VisualAvatar.clear = function()
+    RunService:UnbindFromRenderStep(VisualAvatar.renderName)
+    for _, link in ipairs(VisualAvatar.links) do link:Disconnect() end
+    VisualAvatar.links = {}
+    VisualAvatar.exclusions = {}
+    local firstPerson = VisualAvatar.firstPerson()
+    for item, saved in pairs(VisualAvatar.hidden) do
+        local value = saved.value
+        if saved.property == "LocalTransparencyModifier" and firstPerson then value = 1 end
+        pcall(function() item[saved.property] = value end)
+    end
+    VisualAvatar.hidden = {}
+    if VisualAvatar.model then VisualAvatar.model:Destroy() end
+    if VisualAvatar.kit then VisualAvatar.kit:Destroy() end
+    VisualAvatar.model, VisualAvatar.character, VisualAvatar.rig, VisualAvatar.kit = nil, nil, nil, nil
+    VisualAvatar.queue()
+end
+
+VisualAvatar.hide = function(item)
+    local property
+    if item:IsA("BasePart") then property = "LocalTransparencyModifier"
+    elseif item:IsA("Decal") then property = "Transparency" end
+    if property and not VisualAvatar.hidden[item] then
+        local value = item[property]
+        if property == "LocalTransparencyModifier" and value >= 1 then value = 0 end
+        VisualAvatar.hidden[item] = { property = property, value = value }
+        item[property] = 1
+    end
+end
+
+VisualAvatar.keepHidden = function()
+    for item, saved in pairs(VisualAvatar.hidden) do
+        local now = item[saved.property]
+        if now ~= 1 then
+            saved.value = now
+            item[saved.property] = 1
+        end
+    end
+end
+
+VisualAvatar.passive = function(part)
+    if part.Anchored ~= true then part.Anchored = true end
+    if part.CanCollide ~= false then part.CanCollide = false end
+    if part.CanTouch ~= false then part.CanTouch = false end
+    if part.CanQuery ~= false then part.CanQuery = false end
+    if part.Massless ~= true then part.Massless = true end
+end
+
+VisualAvatar.exclude = function(item, rig)
+    if not item:IsA("BasePart") or VisualAvatar.exclusions[item] then return end
+    local held = {}
+    VisualAvatar.exclusions[item] = held
+    for _, part in ipairs(rig.parts) do
+        local exclusion = Instance.new("NoCollisionConstraint")
+        exclusion.Part0, exclusion.Part1 = part, item
+        exclusion.Parent = part
+        held[#held + 1] = exclusion
+    end
+end
+
+VisualAvatar.frames = function(joint)
+    if joint:IsA("JointInstance") then
+        return joint.Part0, joint.C0, joint.Part1, joint.C1
+    end
+    local a0, a1 = joint.Attachment0, joint.Attachment1
+    if a0 and a1 then return a0.Parent, a0.CFrame, a1.Parent, a1.CFrame end
+    return nil
+end
+
+VisualAvatar.animated = function(joint)
+    return joint:IsA("Motor6D") or joint:IsA("AnimationConstraint")
+end
+
+VisualAvatar.sources = function(character)
+    local index = {}
+    for _, joint in ipairs(character:QueryDescendants("Motor6D, AnimationConstraint")) do
+        local _, _, child = VisualAvatar.frames(joint)
+        if child then index[child.Name .. "/" .. joint.Name] = joint end
+    end
+    return index
+end
+
+VisualAvatar.bend = function(joint)
+    local a, ca, b, cb = VisualAvatar.frames(joint)
+    if not a or not b then return nil end
+    return (a.CFrame * ca):Inverse() * (b.CFrame * cb)
+end
+
+VisualAvatar.prepare = function(model, character)
+    local root = model:FindFirstChild("HumanoidRootPart")
+    local sourceRoot = character:FindFirstChild("HumanoidRootPart")
+    if not root or not sourceRoot then error("The avatar has no root part") end
+    local parts = model:QueryDescendants("BasePart")
+    local edges = {}
+    for _, item in ipairs(model:QueryDescendants("LuaSourceContainer, Animator")) do item:Destroy() end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        humanoid.EvaluateStateMachine = false
+        humanoid.AutoRotate = false
+        humanoid.AutomaticScalingEnabled = false
+        humanoid.BreakJointsOnDeath = false
+        humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+    end
+    for _, part in ipairs(parts) do
+        VisualAvatar.passive(part)
+        edges[part] = {}
+    end
+    for _, joint in ipairs(model:QueryDescendants("JointInstance, AnimationConstraint, RigidConstraint")) do
+        local a, ca, b, cb = VisualAvatar.frames(joint)
+        if a and b and a ~= b and edges[a] and edges[b] then
+            local edge = { a = a, b = b, ca = ca, cb = cb }
+            if VisualAvatar.animated(joint) then edge.key = b.Name .. "/" .. joint.Name end
+            edges[a][#edges[a] + 1] = edge
+            edges[b][#edges[b] + 1] = edge
+        end
+    end
+    for _, joint in ipairs(model:QueryDescendants("JointInstance, Constraint, WeldConstraint")) do
+        pcall(function() joint.Enabled = false end)
+    end
+    local seen, queue, poses = { [root] = true }, { root }, {}
+    local cursor = 1
+    while cursor <= #queue do
+        local parent = queue[cursor]
+        cursor = cursor + 1
+        for _, edge in ipairs(edges[parent]) do
+            local child = edge.a == parent and edge.b or edge.a
+            if not seen[child] then
+                seen[child] = true
+                queue[#queue + 1] = child
+                poses[#poses + 1] = { parent = parent, child = child, edge = edge, reverse = edge.b == parent }
+            end
+        end
+    end
+    local sockets = {}
+    for _, part in ipairs(model:GetChildren()) do
+        if part:IsA("BasePart") and seen[part] then
+            for _, node in ipairs(part:GetChildren()) do
+                if node:IsA("Attachment") and not sockets[node.Name] then sockets[node.Name] = node end
+            end
+        end
+    end
+    local stray = {}
+    for _, part in ipairs(parts) do
+        if not seen[part] then
+            local placed = false
+            for _, node in ipairs(part:GetChildren()) do
+                local socket = node:IsA("Attachment") and sockets[node.Name]
+                if socket then
+                    poses[#poses + 1] = { parent = socket.Parent, child = part, offset = socket.CFrame * node.CFrame:Inverse() }
+                    placed = true
+                    break
+                end
+            end
+            if not placed then
+                local offset = root.CFrame:ToObjectSpace(part.CFrame)
+                if offset.Position.Magnitude <= VisualAvatar.reach then
+                    poses[#poses + 1] = { parent = root, child = part, offset = offset }
+                else
+                    stray[part] = true
+                end
+            end
+        end
+    end
+    return {
+        root = root, sourceRoot = sourceRoot, parts = parts, poses = poses, stray = stray,
+        character = character, humanoid = character:FindFirstChildOfClass("Humanoid"),
+        hip = humanoid and humanoid.HipHeight or 0, sources = VisualAvatar.sources(character), indexedAt = os.clock(),
+    }
+end
+
+VisualAvatar.pose = function(rig)
+    local source, lift = rig.sourceRoot, 0
+    local real = rig.humanoid
+    if real and real.Parent then
+        lift = (rig.root.Size.Y * 0.5 + rig.hip) - (source.Size.Y * 0.5 + real.HipHeight)
+    end
+    rig.root.CFrame = source.CFrame * CFrame.new(0, lift, 0)
+    local stale = false
+    for _, pose in ipairs(rig.poses) do
+        local offset = pose.offset
+        if not offset then
+            local edge = pose.edge
+            local bend = CFrame.identity
+            if edge.key then
+                local joint = rig.sources[edge.key]
+                if joint and joint.Parent and joint:IsDescendantOf(rig.character) then
+                    bend = VisualAvatar.bend(joint) or edge.last or CFrame.identity
+                    edge.last = bend
+                else
+                    stale = true
+                    bend = edge.last or CFrame.identity
+                end
+            end
+            offset = edge.ca * bend * edge.cb:Inverse()
+            if pose.reverse then offset = offset:Inverse() end
+        end
+        pose.child.CFrame = pose.parent.CFrame * offset
+    end
+    if stale and os.clock() - rig.indexedAt > VisualAvatar.reindex then
+        rig.sources, rig.indexedAt = VisualAvatar.sources(rig.character), os.clock()
+    end
+end
+
+VisualAvatar.heal = function()
+    local now = os.clock()
+    if not VisualAvatar.enabled or now - VisualAvatar.healAt < VisualAvatar.healGap then return end
+    VisualAvatar.healAt = now
+    VisualAvatar.request()
+end
+
+VisualAvatar.install = function(model, character, rig)
+    VisualAvatar.clear()
+    VisualAvatar.model, VisualAvatar.character, VisualAvatar.rig = model, character, rig
+    model.Name = MARK .. "_Avatar"
+    VisualAvatar.pose(rig)
+    VisualAvatar.exclusions = {}
+    VisualAvatar.links = {
+        character.DescendantAdded:Connect(function(item)
+            VisualAvatar.exclude(item, rig)
+            VisualAvatar.hide(item)
+        end),
+        character.DescendantRemoving:Connect(function(item)
+            for _, exclusion in ipairs(VisualAvatar.exclusions[item] or {}) do exclusion:Destroy() end
+            VisualAvatar.exclusions[item] = nil
+            local saved = VisualAvatar.hidden[item]
+            if saved then
+                pcall(function() item[saved.property] = saved.value end)
+                VisualAvatar.hidden[item] = nil
+            end
+        end),
+    }
+    for _, part in ipairs(rig.parts) do
+        for _, property in ipairs({ "CanCollide", "CanTouch", "CanQuery", "Anchored", "Massless" }) do
+            VisualAvatar.links[#VisualAvatar.links + 1] = part:GetPropertyChangedSignal(property):Connect(function()
+                if part.Parent then VisualAvatar.passive(part) end
+            end)
+        end
+    end
+    for _, item in ipairs(character:QueryDescendants("BasePart, Decal")) do
+        VisualAvatar.exclude(item, rig)
+        VisualAvatar.hide(item)
+    end
+    VisualAvatar.links[#VisualAvatar.links + 1] = RunService.PreSimulation:Connect(function()
+        for _, part in ipairs(rig.parts) do VisualAvatar.passive(part) end
+    end)
+    model.Parent = Workspace.CurrentCamera or Workspace
+    for _, part in ipairs(rig.parts) do VisualAvatar.passive(part) end
+    RunService:BindToRenderStep(VisualAvatar.renderName, Enum.RenderPriority.Camera.Value + 1, function()
+        if not VisualAvatar.enabled or character ~= LocalPlayer.Character or not character.Parent then
+            VisualAvatar.clear()
+            return
+        end
+        if not model.Parent or not rig.sourceRoot:IsDescendantOf(character) then
+            VisualAvatar.clear()
+            VisualAvatar.heal()
+            return
+        end
+        local camera = Workspace.CurrentCamera
+        if camera and model.Parent ~= camera then model.Parent = camera end
+        VisualAvatar.pose(rig)
+        local firstPerson = VisualAvatar.firstPerson()
+        for _, part in ipairs(rig.parts) do
+            part.LocalTransparencyModifier = (firstPerson or rig.stray[part]) and 1 or 0
+        end
+        VisualAvatar.keepHidden()
+    end)
+    VisualAvatar.queue()
+end
+
+VisualAvatar.fail = function(note)
+    VisualAvatar.enabled = false
+    VisualAvatar.generation = VisualAvatar.generation + 1
+    VisualAvatar.clear()
+    if Toggles and Toggles.visualavatar then Toggles.visualavatar:SetValue(false, true) end
+    Library:Notify(note)
+end
+
+VisualAvatar.dressed = function()
+    return Closet ~= nil and next(Closet.worn) ~= nil
+end
+
+VisualAvatar.alive = function(item)
+    local character = LocalPlayer.Character
+    local ok, inside = pcall(function() return character ~= nil and item:IsDescendantOf(character) end)
+    return ok and inside == true
+end
+
+VisualAvatar.reveal = function(source, copy)
+    local from, to = source:GetDescendants(), copy:GetDescendants()
+    table.insert(from, 1, source)
+    table.insert(to, 1, copy)
+    for index, item in ipairs(from) do
+        local saved, twin = VisualAvatar.hidden[item], to[index]
+        if saved and saved.property == "Transparency" and twin and twin.ClassName == item.ClassName then
+            twin.Transparency = saved.value
+        end
+    end
+end
+
+VisualAvatar.shelve = function(item, undo)
+    local parent = item.Parent
+    item.Parent = nil
+    undo[#undo + 1] = function()
+        if parent and parent.Parent then item.Parent = parent else item:Destroy() end
+    end
+end
+
+VisualAvatar.wear = function(model, index, worn, undo)
+    if type(worn) == "table" then
+        for _, row in ipairs(worn.parts or {}) do
+            local part = model:FindFirstChild(row.part.Name)
+            if part and part:IsA("MeshPart") and VisualAvatar.alive(row.part) then
+                local before = part:Clone()
+                part:ApplyMesh(row.part)
+                undo[#undo + 1] = function()
+                    pcall(function() part:ApplyMesh(before) end)
+                    before:Destroy()
+                end
+            end
+        end
+        worn = worn.tool
+    end
+    if worn == nil or not VisualAvatar.alive(worn) then return end
+    local copy = worn:Clone()
+    if not copy then return end
+    VisualAvatar.reveal(worn, copy)
+    if copy:IsA("Accoutrement") then
+        for _, node in ipairs(copy:GetDescendants()) do
+            if node:IsA("JointInstance") or node:IsA("WeldConstraint") or node:IsA("RigidConstraint") then node:Destroy() end
+        end
+        if not Avatar.attach(model, index, copy, nil) then
+            copy:Destroy()
+            return
+        end
+    elseif copy:IsA("Shirt") or copy:IsA("Pants") or copy:IsA("ShirtGraphic") then
+        for _, old in ipairs(model:GetChildren()) do
+            if old.ClassName == copy.ClassName then VisualAvatar.shelve(old, undo) end
+        end
+    elseif copy:IsA("Decal") then
+        local head = model:FindFirstChild("Head")
+        if not head then
+            copy:Destroy()
+            return
+        end
+        for _, node in ipairs(head:GetChildren()) do
+            if node:IsA("Decal") or node:IsA("SurfaceAppearance") then VisualAvatar.shelve(node, undo) end
+        end
+        if head:IsA("MeshPart") and head.TextureID ~= "" then
+            local texture = head.TextureID
+            head.TextureID = ""
+            undo[#undo + 1] = function() head.TextureID = texture end
+        end
+        copy.Name = "face"
+        model = head
+    elseif copy:IsA("Tool") then
+        local holder = Instance.new("Model")
+        holder.Name = copy.Name
+        local grip, handle = copy.Grip, copy:FindFirstChild("Handle")
+        for _, node in ipairs(copy:GetChildren()) do node.Parent = holder end
+        copy:Destroy()
+        copy = holder
+        for _, node in ipairs(holder:GetDescendants()) do
+            if node:IsA("LuaSourceContainer") then node:Destroy()
+            elseif node:IsA("BasePart") then Closet.settle(node) end
+        end
+        local hand, socket = Closet.gripHand(model)
+        if handle and handle:IsA("BasePart") and hand then
+            local weld = Instance.new("Weld")
+            weld.Name = "RightGrip"
+            weld.Part0, weld.Part1 = hand, handle
+            weld.C0 = socket and socket.CFrame or CFrame.new()
+            weld.C1 = grip
+            weld.Parent = handle
+        end
+    else
+        copy:Destroy()
+        return
+    end
+    copy.Parent = model
+    undo[#undo + 1] = function() copy:Destroy() end
+end
+
+VisualAvatar.dress = function(model)
+    local undo = {}
+    if not VisualAvatar.dressed() or not Avatar then return undo end
+    local ids = {}
+    for id in pairs(Closet.worn) do ids[#ids + 1] = id end
+    table.sort(ids)
+    local index = Avatar.attachmentIndex(model)
+    for _, id in ipairs(ids) do
+        pcall(VisualAvatar.wear, model, index, Closet.worn[id], undo)
+    end
+    return undo
+end
+
+VisualAvatar.undress = function(undo)
+    for index = #(undo or {}), 1, -1 do pcall(undo[index]) end
+end
+
+VisualAvatar.build = function(model, character)
+    VisualAvatar.dress(model)
+    local kit = model:Clone()
+    local ok, err = pcall(function()
+        local rig = VisualAvatar.prepare(model, character)
+        VisualAvatar.install(model, character, rig)
+    end)
+    if not ok then
+        kit:Destroy()
+        error(err, 0)
+    end
+    VisualAvatar.kit = kit
+end
+
+VisualAvatar.drop = function()
+    local look = VisualAvatar.look
+    VisualAvatar.look = nil
+    if not look then return end
+    pcall(function() look.description:Destroy() end)
+    pcall(function() look.pristine:Destroy() end)
+end
+
+VisualAvatar.request = function(fresh)
+    VisualAvatar.generation = VisualAvatar.generation + 1
+    VisualAvatar.typed = VisualAvatar.typed + 1
+    local generation, username = VisualAvatar.generation, VisualAvatar.username
+    local function current() return VisualAvatar.enabled and generation == VisualAvatar.generation end
+    if not current() then return end
+    if username == "" or #username > 20 or not username:match("^[%w_]+$") then
+        VisualAvatar.fail("Enter a Roblox username, not a display name or profile link.")
+        return
+    end
+    task.spawn(function()
+        local description, model, look
+        local stage = "Could not find that username. Check the spelling and try again."
+        local ok = pcall(function()
+            local cached = not fresh and VisualAvatar.look or nil
+            if cached and cached.username ~= username then cached = nil end
+            if not cached then
+                local userId = Players:GetUserIdFromNameAsync(username)
+                if not current() then return end
+                stage = "Could not load that avatar. Please try again."
+                description = Players:GetHumanoidDescriptionFromUserIdAsync(userId)
+                if not current() then return end
+            end
+            stage = "Could not load that avatar. Please try again."
+            local character = LocalPlayer.Character
+            if not character then error("No character") end
+            local humanoid = character:WaitForChild("Humanoid", 10)
+            local root = character:WaitForChild("HumanoidRootPart", 10)
+            if not current() then return end
+            if not humanoid or not root or character ~= LocalPlayer.Character or not character.Parent then
+                error("Character changed")
+            end
+            if cached and cached.rigType == humanoid.RigType then
+                model = cached.pristine:Clone()
+            else
+                if cached then description = cached.description:Clone() end
+                model = Players:CreateHumanoidModelFromDescriptionAsync(description, humanoid.RigType)
+                if not current() then return end
+                look = { username = username, rigType = humanoid.RigType, description = description, pristine = model:Clone() }
+            end
+            if character ~= LocalPlayer.Character or not character.Parent then error("Character changed") end
+            VisualAvatar.build(model, character)
+            model = nil
+            if look then
+                VisualAvatar.drop()
+                VisualAvatar.look, look, description = look, nil, nil
+            end
+        end)
+        if look then look.pristine:Destroy() end
+        if description then description:Destroy() end
+        if model then model:Destroy() end
+        if not current() then return end
+        if not ok then VisualAvatar.fail(stage)
+        else Library:Notify("Visual avatar applied: @" .. username) end
+    end)
+end
+
+VisualAvatar.keyOf = function(item, top)
+    local parent = item.Parent
+    if not parent then return "" end
+    return (parent == top and "~" or parent.Name) .. "/" .. item.Name
+end
+
+VisualAvatar.realKeys = function()
+    local keys, character = {}, VisualAvatar.character
+    for item, saved in pairs(VisualAvatar.hidden) do
+        keys[VisualAvatar.keyOf(item, character)] = saved
+    end
+    return keys
+end
+
+VisualAvatar.cover = function(copy, item, keys)
+    if copy.hidden[item] then return end
+    local saved = keys[VisualAvatar.keyOf(item, copy.target)]
+    if not saved then return end
+    if item:IsA("BasePart") then
+        copy.hidden[item] = { property = "LocalTransparencyModifier", value = 0 }
+        item.LocalTransparencyModifier = 1
+    elseif item:IsA("Decal") then
+        local value = item.Transparency
+        if value >= 1 and saved.property == "Transparency" then value = saved.value end
+        copy.hidden[item] = { property = "Transparency", value = value }
+        item.Transparency = 1
+    end
+end
+
+VisualAvatar.anchors = function(copy)
+    local target = copy.target
+    local head = target:FindFirstChild("Head")
+    copy.anchor = {}
+    for _, part in ipairs(copy.rig.parts) do
+        local same = target:FindFirstChild(part.Name)
+        copy.anchor[part] = (same and same:IsA("BasePart")) and same or head
+    end
+end
+
+VisualAvatar.scaleFor = function(copy, root)
+    return copy.kitScale * math.clamp(root.Size.Y / copy.height, 0.05, 20)
+end
+
+VisualAvatar.fit = function(copy)
+    local model = copy.model
+    local want = VisualAvatar.scaleFor(copy, copy.target:FindFirstChild("HumanoidRootPart"))
+    if math.abs(model:GetScale() - want) > 0.001 then model:ScaleTo(want) end
+    copy.rig = VisualAvatar.prepare(model, copy.target)
+    copy.scale = model:GetScale()
+    for _, part in ipairs(copy.rig.parts) do
+        if copy.base[part] == nil then copy.base[part] = part.Transparency end
+    end
+    VisualAvatar.anchors(copy)
+end
+
+VisualAvatar.skin = function(copy)
+    local target, kit, real = copy.target, VisualAvatar.kit, VisualAvatar.character
+    local root = target:FindFirstChild("HumanoidRootPart")
+    local realRoot = real and real:FindFirstChild("HumanoidRootPart")
+    if not kit or not realRoot or not root or not root:IsA("BasePart") then return false end
+    local keys = VisualAvatar.realKeys()
+    copy.hidden, copy.base, copy.tinted, copy.baseline, copy.extras = {}, {}, {}, {}, {}
+    local worn = {}
+    for _, item in pairs(Closet and Closet.worn or {}) do
+        local source = item
+        if type(item) == "table" then source = item.tool end
+        if source and source.Parent then worn[VisualAvatar.keyOf(source, real)] = source end
+    end
+    for _, item in ipairs(target:GetChildren()) do
+        local source = (item:IsA("Accoutrement") or item:IsA("Tool")) and worn[VisualAvatar.keyOf(item, target)]
+        if source then copy.extras[item] = source end
+    end
+    for _, part in ipairs(real:GetChildren()) do
+        if part:IsA("BasePart") then copy.baseline[part.Name] = { material = part.Material, color = part.Color } end
+    end
+    local model = kit:Clone()
+    model.Name = MARK .. "_Copy"
+    copy.model, copy.kitScale, copy.height = model, model:GetScale(), realRoot.Size.Y
+    VisualAvatar.fit(copy)
+    for _, item in ipairs(target:QueryDescendants("BasePart, Decal")) do VisualAvatar.cover(copy, item, keys) end
+    copy.links = {
+        target.DescendantAdded:Connect(function(item)
+            if copy.model and not item:IsDescendantOf(copy.model) and (item:IsA("BasePart") or item:IsA("Decal")) then
+                VisualAvatar.cover(copy, item, keys)
+                copy.stale = true
+            end
+        end),
+    }
+    model.Parent = target
+    VisualAvatar.paint(copy)
+    return true
+end
+
+VisualAvatar.tint = function(copy, part, anchor)
+    if not copy.tinted[part] then
+        copy.tinted[part] = true
+        if part:IsA("MeshPart") then part.TextureID = "" end
+        for _, node in ipairs(part:GetChildren()) do
+            if node:IsA("SurfaceAppearance") then node:Destroy()
+            elseif node:IsA("Decal") then node.Transparency = 1 end
+        end
+    end
+    if part.Material ~= anchor.Material then part.Material = anchor.Material end
+    if part.Color ~= anchor.Color then part.Color = anchor.Color end
+end
+
+VisualAvatar.paint = function(copy)
+    local target, model = copy.target, copy.model
+    local root = target:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    if model:GetScale() ~= copy.scale or math.abs(model:GetScale() - VisualAvatar.scaleFor(copy, root)) > 0.001 then
+        VisualAvatar.fit(copy)
+    elseif copy.stale then
+        copy.stale = false
+        VisualAvatar.anchors(copy)
+    end
+    VisualAvatar.pose(copy.rig)
+    for item, saved in pairs(copy.hidden) do
+        if item[saved.property] ~= 1 then item[saved.property] = 1 end
+    end
+    local steady = true
+    for _, part in ipairs(copy.rig.parts) do
+        local anchor, fade = copy.anchor[part], 0
+        if anchor then
+            fade = anchor.Transparency
+            local look = copy.baseline[anchor.Name]
+            if look and anchor ~= root then
+                if anchor.Color ~= look.color or (anchor.Material ~= look.material and VisualAvatar.styled[anchor.Material.Name]) then
+                    VisualAvatar.tint(copy, part, anchor)
+                elseif copy.tinted[part] then
+                    steady = false
+                end
+            end
+        end
+        local value = copy.rig.stray[part] and 1 or 1 - (1 - copy.base[part]) * (1 - fade)
+        if part.Transparency ~= value then part.Transparency = value end
+    end
+    return steady
+end
+
+VisualAvatar.release = function(copy)
+    for _, link in ipairs(copy.links or {}) do link:Disconnect() end
+    if copy.model then pcall(function() copy.model:Destroy() end) end
+    for item, saved in pairs(copy.hidden or {}) do
+        pcall(function() item[saved.property] = saved.value end)
+    end
+    for item, source in pairs(copy.extras or {}) do
+        if not VisualAvatar.wearing(source) then pcall(function() item:Destroy() end) end
+    end
+    VisualAvatar.undress(copy.undo)
+    copy.links, copy.model, copy.rig, copy.hidden, copy.undo = nil, nil, nil, nil, nil
+end
+
+VisualAvatar.wearing = function(source)
+    for _, item in pairs(Closet and Closet.worn or {}) do
+        if item == source or (type(item) == "table" and item.tool == source) then return true end
+    end
+    return false
+end
+
+VisualAvatar.fingerprint = function(humanoid)
+    local description = humanoid and humanoid:FindFirstChildOfClass("HumanoidDescription")
+    if not description then return nil end
+    local ok, print = pcall(function()
+        local d = description
+        local worn = {}
+        for _, row in ipairs(d:GetAccessories(true)) do worn[#worn + 1] = tostring(row.AssetId) end
+        table.sort(worn)
+        return table.concat({
+            d.Face, d.Shirt, d.Pants, d.GraphicTShirt, d.Head, d.Torso, d.LeftArm, d.RightArm, d.LeftLeg, d.RightLeg,
+            table.concat(worn, ","), tostring(d.HeadColor), tostring(d.TorsoColor), tostring(d.LeftArmColor),
+            tostring(d.RightLegColor),
+        }, "|")
+    end)
+    return ok and print or nil
+end
+
+VisualAvatar.accepts = function(item)
+    local character = LocalPlayer.Character
+    if item == character or not item:IsDescendantOf(Workspace) then return false end
+    local name = LocalPlayer.Name
+    if item.Name == name or item.Name == "BOT_ONSCREEN_" .. name then return true end
+    if Players:FindFirstChild(item.Name) then return false end
+    local mine = character and VisualAvatar.fingerprint(character:FindFirstChildOfClass("Humanoid"))
+    return mine ~= nil and VisualAvatar.fingerprint(item:FindFirstChildOfClass("Humanoid")) == mine
+end
+
+VisualAvatar.still = function(copy)
+    local target = copy.target
+    return target.Parent ~= nil and (copy.kind ~= "clone" or (target.Name == copy.name and target:IsDescendantOf(Workspace)))
+end
+
+VisualAvatar.apply = function(copy)
+    VisualAvatar.release(copy)
+    local target = copy.target
+    if not VisualAvatar.still(copy) then
+        VisualAvatar.copies[target] = nil
+        return
+    end
+    if VisualAvatar.enabled and VisualAvatar.kit then
+        local ok, done = pcall(VisualAvatar.skin, copy)
+        if not ok or not done then VisualAvatar.release(copy) end
+    elseif copy.kind == "rig" and VisualAvatar.dressed() then
+        local ok, undo = pcall(VisualAvatar.dress, target)
+        if ok then copy.undo = undo end
+    end
+end
+
+VisualAvatar.adopt = function(target, kind)
+    if VisualAvatar.unloaded or VisualAvatar.copies[target] then return end
+    local copy = { target = target, kind = kind, name = target.Name }
+    VisualAvatar.copies[target] = copy
+    VisualAvatar.apply(copy)
+    VisualAvatar.drive()
+end
+
+VisualAvatar.step = function()
+    for target, copy in pairs(VisualAvatar.copies) do
+        if copy.model then
+            local live = copy.model.Parent == target and VisualAvatar.still(copy)
+            local ok, steady = false, false
+            if live then ok, steady = pcall(VisualAvatar.paint, copy) end
+            if not live or not ok then
+                VisualAvatar.release(copy)
+                VisualAvatar.copies[target] = nil
+            elseif not steady then
+                VisualAvatar.apply(copy)
+            end
+        end
+    end
+    VisualAvatar.drive()
+end
+
+VisualAvatar.drive = function()
+    local live = false
+    for _, copy in pairs(VisualAvatar.copies) do
+        if copy.model then
+            live = true
+            break
+        end
+    end
+    if live == (VisualAvatar.driving ~= nil) then return end
+    if live then
+        RunService:BindToRenderStep(VisualAvatar.copyName, Enum.RenderPriority.Camera.Value + 2, VisualAvatar.step)
+        VisualAvatar.driving = RunService.PreSimulation:Connect(function()
+            for _, copy in pairs(VisualAvatar.copies) do
+                if copy.rig then
+                    for _, part in ipairs(copy.rig.parts) do VisualAvatar.passive(part) end
+                end
+            end
+        end)
+    else
+        RunService:UnbindFromRenderStep(VisualAvatar.copyName)
+        VisualAvatar.driving:Disconnect()
+        VisualAvatar.driving = nil
+    end
+end
+
+VisualAvatar.addWorn = function(description)
+    if not VisualAvatar.dressed() then return end
+    local list, seen = description:GetAccessories(true), {}
+    for _, row in ipairs(list) do seen[row.AssetId] = true end
+    for id, worn in pairs(Closet.worn) do
+        if type(worn) ~= "table" and VisualAvatar.alive(worn) then
+            if worn:IsA("Shirt") then description.Shirt = id
+            elseif worn:IsA("Pants") then description.Pants = id
+            elseif worn:IsA("ShirtGraphic") then description.GraphicTShirt = id
+            elseif worn:IsA("Decal") then description.Face = id
+            elseif worn:IsA("Accoutrement") and not seen[id] then
+                local handle = worn:FindFirstChild("Handle")
+                local layered = handle ~= nil and handle:FindFirstChildWhichIsA("WrapLayer") ~= nil
+                local name = VisualAvatar.accessoryTypes[Closet.types[id] or 0]
+                local kind = name and Enum.AccessoryType[name] or nil
+                if not kind and worn:IsA("Accessory") and worn.AccessoryType ~= Enum.AccessoryType.Unknown then kind = worn.AccessoryType end
+                if not kind and not layered then kind = Enum.AccessoryType.Hat end
+                if kind then
+                    list[#list + 1] = { AssetId = id, AccessoryType = kind, IsLayered = layered, Order = layered and #list + 1 or nil }
+                end
+            end
+        end
+    end
+    description:SetAccessories(list, true)
+end
+
+VisualAvatar.describe = function()
+    local description
+    if VisualAvatar.enabled and VisualAvatar.kit and VisualAvatar.look then
+        description = VisualAvatar.look.description:Clone()
+    elseif VisualAvatar.dressed() then
+        description = Players:GetHumanoidDescriptionFromUserIdAsync(LocalPlayer.UserId)
+    end
+    if description then pcall(VisualAvatar.addWorn, description) end
+    return description
+end
+
+VisualAvatar.template = function(description)
+    local rig = ReplicatedStorage.Assets.Misc.EmoteRig:Clone()
+    rig.Name = "RigTemplate"
+    rig.Parent = ReplicatedStorage
+    rig.PrimaryPart.Anchored = true
+    for _, field in ipairs({ "Head", "LeftArm", "RightArm", "LeftLeg", "RightLeg", "Torso", "BodyTypeScale", "ProportionScale" }) do
+        description[field] = 0
+    end
+    description.HeightScale = math.clamp(description.HeightScale, 0.9, 1)
+    local ok, err = pcall(function()
+        rig.Humanoid:ApplyDescription(description, Enum.AssetTypeVerification.Default)
+    end)
+    rig.Parent = nil
+    if not ok then
+        rig:Destroy()
+        error(err, 0)
+    end
+    rig:PivotTo(CFrame.new())
+    return rig
+end
+
+VisualAvatar.forget = function()
+    local template = VisualAvatar.templates
+    if not template then return end
+    local id = LocalPlayer.UserId
+    if template.ClientRig then
+        pcall(function() template.ClientRig:Destroy() end)
+        template.ClientRig, template.FetchingClient = nil, nil
+    end
+    local held = template.Users and template.Users[id]
+    if held then
+        pcall(function() held:Destroy() end)
+        template.Users[id] = nil
+        local at = table.find(template.UserOrder, id)
+        if at then table.remove(template.UserOrder, at) end
+    end
+end
+
+VisualAvatar.hook = function()
+    if VisualAvatar.hooked or VisualAvatar.unloaded then return end
+    VisualAvatar.hooked = true
+    pcall(function()
+        local cutscene = require(game:GetService("ReplicatedFirst").Components.Cutscene)
+        local original = Restore.remember("visualavatar.cutscene", cutscene.LoadRigFromPlayer)
+        if type(original) ~= "function" then return end
+        local wrapped = function(self, rig, player, ...)
+            original(self, rig, player, ...)
+            if player == LocalPlayer and rig and rig.Parent then pcall(VisualAvatar.adopt, rig, "rig") end
+        end
+        cutscene.LoadRigFromPlayer = wrapped
+        VisualAvatar.hooks[#VisualAvatar.hooks + 1] = function()
+            if cutscene.LoadRigFromPlayer == wrapped then cutscene.LoadRigFromPlayer = original end
+        end
+    end)
+    pcall(function()
+        local template = require(ReplicatedStorage.Tools.Utility.RigTemplate)
+        local original = Restore.remember("visualavatar.rigtemplate", template._buildAsync)
+        if type(original) ~= "function" then return end
+        local wrapped = function(userId, ...)
+            if userId == LocalPlayer.UserId then
+                local described, description = pcall(VisualAvatar.describe)
+                if described and description then
+                    local built, rig = pcall(VisualAvatar.template, description)
+                    description:Destroy()
+                    if built and rig then return rig end
+                end
+            end
+            return original(userId, ...)
+        end
+        template._buildAsync = wrapped
+        VisualAvatar.templates = template
+        VisualAvatar.hooks[#VisualAvatar.hooks + 1] = function()
+            if template._buildAsync == wrapped then template._buildAsync = original end
+        end
+    end)
+end
+
+VisualAvatar.watch = function()
+    if VisualAvatar.enabled or VisualAvatar.dressed() then VisualAvatar.hook() end
+    if VisualAvatar.enabled and not VisualAvatar.watcher then
+        VisualAvatar.watcher = Workspace.DescendantAdded:Connect(function(item)
+            if item.ClassName == "Model" and VisualAvatar.kit and VisualAvatar.accepts(item)
+                and item:FindFirstChildOfClass("Humanoid") then
+                VisualAvatar.adopt(item, "clone")
+            end
+        end)
+    elseif not VisualAvatar.enabled and VisualAvatar.watcher then
+        VisualAvatar.watcher:Disconnect()
+        VisualAvatar.watcher = nil
+    end
+end
+
+VisualAvatar.queue = function(closet)
+    if closet then VisualAvatar.closetDirty = true end
+    if VisualAvatar.queued or VisualAvatar.unloaded then return end
+    VisualAvatar.queued = true
+    task.defer(VisualAvatar.refit)
+end
+
+VisualAvatar.refit = function()
+    if VisualAvatar.unloaded then
+        VisualAvatar.queued = false
+        return
+    end
+    if VisualAvatar.closetDirty then
+        VisualAvatar.closetDirty = false
+        local look, character = VisualAvatar.look, VisualAvatar.character
+        if VisualAvatar.enabled and VisualAvatar.model and look and character == LocalPlayer.Character then
+            local model = look.pristine:Clone()
+            if not pcall(VisualAvatar.build, model, character) then
+                model:Destroy()
+                VisualAvatar.heal()
+            end
+        end
+    end
+    VisualAvatar.queued = false
+    VisualAvatar.watch()
+    VisualAvatar.forget()
+    for _, copy in pairs(VisualAvatar.copies) do VisualAvatar.apply(copy) end
+    VisualAvatar.drive()
+end
+
+VisualAvatar.closetChanged = function()
+    VisualAvatar.queue(true)
+end
+
+VisualAvatar.unload = function()
+    VisualAvatar.unloaded = true
+    for target, copy in pairs(VisualAvatar.copies) do
+        VisualAvatar.release(copy)
+        VisualAvatar.copies[target] = nil
+    end
+    VisualAvatar.drive()
+    if VisualAvatar.watcher then
+        VisualAvatar.watcher:Disconnect()
+        VisualAvatar.watcher = nil
+    end
+    VisualAvatar.forget()
+    for _, undo in ipairs(VisualAvatar.hooks) do pcall(undo) end
+    VisualAvatar.hooks, VisualAvatar.hooked, VisualAvatar.templates = {}, false, nil
+    VisualAvatar.drop()
+    if Closet and Closet.onChange == VisualAvatar.closetChanged then Closet.onChange = nil end
+end
+
+VisualAvatar.setUsername = function(value)
+    local username = tostring(value or ""):match("^%s*(.-)%s*$"):gsub("^@", "")
+    if username == VisualAvatar.username then return end
+    VisualAvatar.username = username
+    if not VisualAvatar.enabled then return end
+    VisualAvatar.typed = VisualAvatar.typed + 1
+    local typed = VisualAvatar.typed
+    task.delay(VisualAvatar.settle, function()
+        if VisualAvatar.enabled and typed == VisualAvatar.typed then VisualAvatar.request() end
+    end)
+end
+
+VisualAvatar.setEnabled = function(enabled)
+    VisualAvatar.enabled = enabled == true
+    if VisualAvatar.enabled then VisualAvatar.request()
+    else
+        VisualAvatar.generation = VisualAvatar.generation + 1
+        VisualAvatar.typed = VisualAvatar.typed + 1
+        VisualAvatar.clear()
+    end
+end
+
+track(LocalPlayer.CharacterAdded:Connect(function()
+    VisualAvatar.clear()
+    if VisualAvatar.enabled then VisualAvatar.request() end
+end))
+track(LocalPlayer.CharacterRemoving:Connect(function()
+    VisualAvatar.generation = VisualAvatar.generation + 1
+    VisualAvatar.clear()
+end))
+Restore.keep("visualavatar", function()
+    VisualAvatar.setEnabled(false)
+    VisualAvatar.unload()
+end)
+if Closet then Closet.onChange = VisualAvatar.closetChanged end
+
+
+FakeAnim.rivals = {
+    Jump = { "akarijumpanim", "hintojumpanim", "mamorijumpanim" },
+    Spike = { "akarispikeanim", "hintospikeanim", "mamorispikeanim" },
+}
+
+FakeAnim.pick = function(id, group, style, label, on)
+    if FakeAnim.setGroup(group, on, style) then
+        if not on then return end
+        for _, other in ipairs(FakeAnim.rivals[group]) do
+            local toggle = other ~= id and Toggles and Toggles[other]
+            if toggle and toggle.Value and type(toggle.SetValue) == "function" then
+                toggle:SetValue(false, true)
+            end
+        end
+        return
+    end
+    if not on then return end
+    local own = Toggles and Toggles[id]
+    if own and type(own.SetValue) == "function" then own:SetValue(false, true) end
+    Library:Notify(label .. " isn't available right now")
+end
+
+task.delay(1, function()
+    if not Library.Unloaded then pcall(Cosmetics.restore) end
+end)
+
+-- === cosmetic API (no UI) ===
+do
+    local genv = (type(getgenv) == "function" and getgenv()) or _G
+    genv.TomboyCosmetics = {
+        Cosmetics = Cosmetics,
+        Vault = Vault,
+        Nick = Nick,
+        Level = Level,
+        VisualAvatar = VisualAvatar,
+        FakeAnim = FakeAnim,
+        Closet = Closet,
+        PlayerCard = PlayerCard,
+        applyJersey = applyJersey,
+        enablePlayerCard = enablePlayerCard,
+        disablePlayerCard = disablePlayerCard,
+        setBall = function(id) selectedBallSkin = id end,
+        setTitle = function(id) selectedTitle = id end,
+        setEffect = function(id) selectedEffect = id end,
+        setJersey = function(id) selectedJersey = id; pickedTeam = nil end,
+        autoJersey = function(on) autoApplyJersey = on and true or false; if on then applyJersey(selectedJersey) end end,
+        setCard = function(id) selectedCard = id end,
+        unload = function() local s = genv.TOMBOY_COSMETIC_SESSION; if s and s.unload then s.unload() end; genv.TomboyCosmetics = nil end,
+    }
+end
